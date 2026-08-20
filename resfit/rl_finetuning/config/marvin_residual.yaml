@@ -1,0 +1,94 @@
+# Formal route-1 Marvin Residual TD3 configuration.
+defaults:
+  - marvin_residual_td3_config
+  - _self_
+
+environment_backend: marvin
+task: Insert the USB plug
+seed: 1000
+num_envs: 1
+eval_num_envs: 1
+eval_num_episodes: 1
+log_freq: 100
+checkpoint_interval: 100
+save_video: false
+algo:
+  total_timesteps: 300000
+  batch_size: 256
+  buffer_size: 200000
+  learning_starts: 1000
+  offline_fraction: 0.5
+  n_step: 3
+  gamma: 0.99
+  num_updates_per_iteration: 4
+  actor_updates_per_iteration: 1
+  update_every_n_steps: 1
+  critic_warmup_steps: 1000
+  sampling_strategy: uniform
+  stddev_max: 0.05
+  stddev_min: 0.05
+  stddev_step: 300000
+agent:
+  actor_lr: 0.000001
+  critic_lr: 0.0001
+  critic_target_tau: 0.005
+  actor:
+    action_scale: 0.1
+    actor_last_layer_init_scale: 0.0
+wandb:
+  project: marvin-residual-td3-route1
+  mode: online
+  # Reuse one remote run across latest.pt resumes.
+  continue_run_id: marvinresidualc20e5s1000
+  name: marvin-route1-residual-td3-seed1000
+rl_camera:
+  - observation.images.side_policy
+  - observation.images.wrist_1buchong
+  - observation.images.wrist_1
+  - observation.images.wrist_2
+offline_data:
+  name: marvin_usb_rl
+  root: /home/xlb/code/强化微调ACT/datasets/residual_v21/marvin_usb_rl
+  num_episodes: 807
+  use_base_policy_for_base_actions: true
+  min_action_range: 0.1
+  min_state_std: 0.1
+marvin:
+  learner_only: true
+  learner_updates_per_run: 500
+  # Full checkpoints are large; keep only the two newest numbered snapshots.
+  # latest.pt and the compact deployment actor are updated atomically.
+  training_checkpoint_keep_last: 2
+  async_grpc: true
+  grpc_host: 127.0.0.1
+  grpc_port: 50051
+  grpc_parameter_push_s: 1.0
+  learner_gpu_memory_fraction: 0.8
+  actor_publish_interval: 50
+  # Memory fraction is not a compute quota. Yield between update groups so
+  # the actor can enqueue latency-sensitive inference work on a single GPU.
+  learner_update_sleep_s: 0.01
+  base_policy_checkpoint: /home/xlb/code/强化微调ACT/outputs/residual_route1_act/best_eval/policy
+  # ACT predicts 20 future actions but only executes the first 5 before
+  # observing again and replanning. Residual correction remains per-step.
+  base_policy_chunk_size: 20
+  base_policy_n_action_steps: 5
+  marvin_root: /home/xlb/code/强化微调ACT
+  device: cuda
+  host: 127.0.0.1
+  port: 8765
+  max_steps: 200
+  # null follows the original ResFiT action path. A numeric value is an
+  # optional hardware safety cap expressed in normalized residual units.
+  residual_scale: null
+  contact_start_step: 0
+  enable_gripper_residual: false
+  # Learner-only never connects to Bridge. Any integrated hardware fallback
+  # must explicitly override both learner_only=false and allow_real_robot=true.
+  allow_real_robot: false
+  replay_dir: /home/xlb/code/强化微调ACT/outputs/marvin_residual_td3_chunk20_exec5/replay
+  residual_checkpoint: /home/xlb/code/强化微调ACT/outputs/marvin_residual_td3_chunk20_exec5/deployment/residual_actor_latest.pt
+  training_checkpoint_dir: /home/xlb/code/强化微调ACT/outputs/marvin_residual_td3_chunk20_exec5/checkpoints
+  # Reuse latest.pt when present; otherwise start a fresh learner.
+  resume_checkpoint: auto
+  minimum_replay_transitions: 1000

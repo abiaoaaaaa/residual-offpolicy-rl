@@ -45,6 +45,7 @@ from typing import Any
 import imageio
 import numpy as np
 import torch
+from lerobot.common.datasets.compute_stats import aggregate_stats
 from lerobot.common.datasets.factory import resolve_delta_timestamps
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.common.datasets.transforms import ImageTransforms, ImageTransformsConfig
@@ -103,6 +104,20 @@ parser.add_argument("--steps", type=int, default=100_000, help="Total optimizati
 parser.add_argument("--batch_size", type=int, default=64)
 parser.add_argument("--grad_clip_norm", type=float, default=10.0)
 parser.add_argument("--num_workers", type=int, default=4)
+parser.add_argument(
+    "--eval_fraction",
+    type=float,
+    default=0.0,
+    help="Fraction of whole episodes held out for offline validation; 0 disables hold-out eval",
+)
+parser.add_argument("--eval_freq", type=int, default=2_000, help="Run hold-out eval every N optimizer steps")
+parser.add_argument(
+    "--eval_batches",
+    type=int,
+    default=0,
+    help="Maximum validation batches per eval; 0 evaluates the complete hold-out split",
+)
+parser.add_argument("--split_seed", type=int, default=1_000, help="Episode-level train/eval split seed")
 
 # Reproducibility / device
 parser.add_argument("--seed", type=int, default=None)
@@ -228,6 +243,34 @@ logging.basicConfig(
 
 # Create a named logger
 logger = logging.getLogger(__name__)
+
+
+@torch.inference_mode()
+def _evaluate_holdout(policy, dataloader, device: torch.device, max_batches: int) -> tuple[float, int, int]:
+    """Return sample-weighted loss on an augmentation-free validation split."""
+    was_training = policy.training
+    policy.eval()
+    weighted_loss = 0.0
+    sample_count = 0
+    batch_count = 0
+    try:
+        for batch_count, batch in enumerate(dataloader, start=1):
+            if max_batches > 0 and batch_count > max_batches:
+                batch_count -= 1
+                break
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor):
+                    batch[key] = value.to(device, non_blocking=True)
+            loss, _ = policy.forward(batch)
+            current_batch_size = int(batch["action"].shape[0])
+            weighted_loss += float(loss.item()) * current_batch_size
+            sample_count += current_batch_size
+    finally:
+        if was_training:
+            policy.train()
+    if sample_count == 0:
+        raise RuntimeError("Hold-out eval split produced no samples")
+    return weighted_loss / sample_count, sample_count, batch_count
 
 
 # -----------------------------------------------------------------------------
@@ -414,9 +457,10 @@ def main(cfg: argparse.Namespace):
     # Create run start time for organizing video outputs
     run_start_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    # Create a timestamped folder in CACHE_DIR for all outputs
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_cache_dir = _CACHE_ROOT / f"bc_run_{timestamp}_{Path(cfg.dataset).name}_{cfg.policy}"
+    # Route-1 training must keep local checkpoints for the residual learner.
+    # Honor the explicit CLI output directory instead of writing to a
+    # temporary cache that is deleted at process exit.
+    run_cache_dir = Path(cfg.output_dir).expanduser().resolve()
     run_cache_dir.mkdir(parents=True, exist_ok=True)
 
     if cfg.seed is not None:
@@ -474,7 +518,7 @@ def main(cfg: argparse.Namespace):
 
     policy_cfg = make_policy_config(cfg.policy, **policy_kwargs)
 
-    # Set the chunk size to 20 (env is at 20 fps)
+    # Marvin data is 10 Hz, so a 20-step chunk spans two seconds.
     policy_cfg.chunk_size = 20
     policy_cfg.n_action_steps = 20
 
@@ -541,6 +585,13 @@ def main(cfg: argparse.Namespace):
 
     logger.info("Building LeRobotDataset with inferred delta-timestamps…")
 
+    if not 0.0 <= cfg.eval_fraction < 1.0:
+        raise ValueError("--eval_fraction must be in [0, 1)")
+    if cfg.eval_fraction > 0.0 and cfg.eval_freq <= 0:
+        raise ValueError("--eval_freq must be positive when hold-out eval is enabled")
+    if cfg.eval_batches < 0:
+        raise ValueError("--eval_batches must be non-negative")
+
     image_transforms_config = ImageTransformsConfig(enable=True)
     image_transforms = ImageTransforms(image_transforms_config)
 
@@ -551,11 +602,77 @@ def main(cfg: argparse.Namespace):
         image_transforms=image_transforms,
     )
 
+    train_dataset = dataset
+    eval_dataloader = None
+    split_manifest = None
+    if cfg.eval_fraction > 0.0:
+        episode_values = [int(value) for value in dataset.hf_dataset["episode_index"]]
+        episode_ids = sorted(set(episode_values))
+        if len(episode_ids) < 2:
+            raise ValueError("Hold-out eval requires at least two episodes")
+        eval_episode_count = max(1, min(len(episode_ids) - 1, round(len(episode_ids) * cfg.eval_fraction)))
+        shuffled_episode_ids = np.random.default_rng(cfg.split_seed).permutation(episode_ids).tolist()
+        eval_episode_ids = sorted(int(value) for value in shuffled_episode_ids[:eval_episode_count])
+        train_episode_ids = sorted(int(value) for value in shuffled_episode_ids[eval_episode_count:])
+        split_manifest = {
+            "schema_version": 1,
+            "dataset": cfg.dataset,
+            "split_unit": "episode",
+            "split_seed": cfg.split_seed,
+            "eval_fraction": cfg.eval_fraction,
+            "normalization_stats": "train_episodes_only",
+            "train_episodes": train_episode_ids,
+            "eval_episodes": eval_episode_ids,
+        }
+        split_path = run_cache_dir / "dataset_split.json"
+        if split_path.is_file():
+            existing_split = json.loads(split_path.read_text())
+            if existing_split != split_manifest:
+                raise ValueError(
+                    f"Existing split manifest conflicts with current arguments: {split_path}. "
+                    "Use the original split settings or a new --output_dir."
+                )
+        else:
+            split_path.write_text(json.dumps(split_manifest, indent=2) + "\n")
+
+        train_episode_set = set(train_episode_ids)
+        eval_episode_set = set(eval_episode_ids)
+        train_indices = [index for index, episode in enumerate(episode_values) if episode in train_episode_set]
+        eval_indices = [index for index, episode in enumerate(episode_values) if episode in eval_episode_set]
+        # Prevent hold-out leakage: ACT's state/action/image normalizers must be
+        # fitted only on training episodes. The validation loader still reads
+        # raw samples; the policy applies these frozen train-only statistics to
+        # both splits, matching deployment semantics.
+        ds_meta.stats = aggregate_stats([ds_meta.episodes_stats[episode] for episode in train_episode_ids])
+        train_dataset = torch.utils.data.Subset(dataset, train_indices)
+        eval_dataset = LeRobotDataset(
+            cfg.dataset,
+            delta_timestamps=delta_timestamps,
+            download_videos=True,
+            image_transforms=ImageTransforms(ImageTransformsConfig(enable=False)),
+        )
+        eval_dataloader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(eval_dataset, eval_indices),
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            pin_memory=device.type != "cpu",
+            drop_last=False,
+            persistent_workers=cfg.num_workers > 0,
+        )
+        logger.info(
+            "Episode hold-out split: train=%d episodes/%d frames, eval=%d episodes/%d frames",
+            len(train_episode_ids),
+            len(train_indices),
+            len(eval_episode_ids),
+            len(eval_indices),
+        )
+
     # ---------------------------------------------------------------------
     # Dataloader
     # ---------------------------------------------------------------------
     dataloader = torch.utils.data.DataLoader(
-        dataset,
+        train_dataset,
         batch_size=cfg.batch_size,
         shuffle=True,
         num_workers=cfg.num_workers,
@@ -619,6 +736,7 @@ def main(cfg: argparse.Namespace):
 
         # NEW: Log image transforms configuration
         extra_cfg["image_transforms"] = asdict(image_transforms_config)
+        extra_cfg["dataset_split"] = split_manifest
 
         wandb.init(
             project=cfg.wandb_project,
@@ -664,6 +782,10 @@ def main(cfg: argparse.Namespace):
 
     # Track the best evaluation success-rate achieved so far (used for early-stopping style checkpointing)
     best_success_rate = 0.0
+    best_eval_loss = float("inf")
+    best_eval_metrics_path = output_dir / "best_eval_metrics.json"
+    if best_eval_metrics_path.is_file():
+        best_eval_loss = float(json.loads(best_eval_metrics_path.read_text())["eval_loss"])
 
     if cfg.rollout_freq and cfg.eval_env:
         # ------------------------------------------------------------------
@@ -771,7 +893,7 @@ def main(cfg: argparse.Namespace):
                 f" | iter: {iter_ms:.1f} ms"
             )
             logger.info(msg)
-            if wandb is not None:
+            if cfg.wandb_enable:
                 wandb.log(
                     {
                         "train/loss": loss_val,
@@ -804,7 +926,7 @@ def main(cfg: argparse.Namespace):
                 )
             )
 
-            if wandb is not None:
+            if cfg.wandb_enable:
                 # Log model-only artifact (no optimizer)
                 art_model = wandb.Artifact(name=f"run_{wandb.run.id}_model_step_{step}", type="model")
                 art_model.add_dir(str(model_dir))
@@ -816,6 +938,51 @@ def main(cfg: argparse.Namespace):
                 wandb.log_artifact(art_latest, aliases=["latest"])
 
         step += 1
+
+        # ------------------------------------------------------------------
+        # Offline hold-out evaluation --------------------------------------
+        # ------------------------------------------------------------------
+        if eval_dataloader is not None and (step % cfg.eval_freq == 0 or step == cfg.steps):
+            eval_t0 = time.perf_counter()
+            eval_loss, eval_samples, eval_batch_count = _evaluate_holdout(
+                policy, eval_dataloader, device, cfg.eval_batches
+            )
+            eval_ms = (time.perf_counter() - eval_t0) * 1000
+            logger.info(
+                colored(
+                    f"[step {step:>6d}] hold-out eval_loss: {eval_loss:.6f} | "
+                    f"samples: {eval_samples} | batches: {eval_batch_count} | eval: {eval_ms / 1000:.2f} s",
+                    "cyan",
+                )
+            )
+            if cfg.wandb_enable:
+                wandb.log(
+                    {
+                        "eval/loss": eval_loss,
+                        "eval/samples": eval_samples,
+                        "time/holdout_eval_ms": eval_ms,
+                    },
+                    step=step,
+                )
+            if eval_loss < best_eval_loss:
+                best_eval_loss = eval_loss
+                best_eval_dir = output_dir / "best_eval"
+                if best_eval_dir.exists():
+                    shutil.rmtree(best_eval_dir)
+                save_checkpoint(best_eval_dir, step, policy, optimizer)
+                best_eval_metrics_path.write_text(
+                    json.dumps(
+                        {
+                            "step": step,
+                            "eval_loss": eval_loss,
+                            "eval_samples": eval_samples,
+                            "eval_batches": eval_batch_count,
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                )
+                logger.info(colored(f"New best hold-out loss; saved {best_eval_dir / 'policy'}", "magenta"))
 
         # ------------------------------------------------------------------
         # Rollout evaluation -----------------------------------------------
@@ -847,7 +1014,7 @@ def main(cfg: argparse.Namespace):
                 )
             )
 
-            if wandb is not None:
+            if cfg.wandb_enable:
                 wandb.log(
                     {
                         "eval/success_rate": success_rate,
@@ -878,27 +1045,20 @@ def main(cfg: argparse.Namespace):
                     shutil.rmtree(best_dir)
                 save_checkpoint(best_dir, step, policy, optimizer)
 
-                if wandb is not None:
+                if cfg.wandb_enable:
                     # Overwrite/refresh the "best" artifact so that the most recent best checkpoint is easy to retrieve
                     art_best = wandb.Artifact(name=f"run_{wandb.run.id}_best", type="model")
                     art_best.add_dir(str(best_dir))
                     wandb.log_artifact(art_best, aliases=["best", "latest"])
 
     logger.info(colored("Training finished!", "green", attrs=["bold"]))
-    if wandb is not None:
+    if cfg.wandb_enable:
         wandb.finish()
 
     if eval_env is not None:
         eval_env.close()
 
-    # ---------------------------------------------------------------------
-    # Cleanup --------------------------------------------------------------
-    # ---------------------------------------------------------------------
-    # Clean up entire run directory after successful completion (videos/logs are saved to wandb)
-    if run_cache_dir.exists():
-        logger.info(f"Cleaning up run directory: {run_cache_dir}")
-        shutil.rmtree(run_cache_dir)
-        logger.info("Run directory cleaned up successfully.")
+    logger.info(f"Local checkpoints retained at {run_cache_dir}")
 
 
 if __name__ == "__main__":

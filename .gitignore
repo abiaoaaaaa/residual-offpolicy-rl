@@ -1,8 +1,23 @@
 artifacts/
 outputs/
-__pycache__
+__pycache__/
+*.py[cod]
+.pytest_cache/
+pytest-cache-files-*/
 wandb/
 offline_buffer_cache/
 online_buffer_cache/
 bc_run_*
 deps/
+
+# Local environments, editors, and transient test/build files.
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+*.swp
+*.swo

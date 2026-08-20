@@ -15,6 +15,7 @@ from resfit.rl_finetuning.config.rlpd import ActorConfig, QAgentConfig, RLPDAlgo
 class OfflineDataConfig:
     name: str = "ankile/robomimic-mh-can-image"
     num_episodes: int | None = 300
+    root: str | None = None
     # Offline data action labeling options
     use_base_policy_for_base_actions: bool = True
     # Normalization safeguards
@@ -78,6 +79,9 @@ class ResidualTD3AlgoConfig(RLPDAlgoConfig):
 # -----------------------------------------------------------------------------
 @dataclass
 class ResidualTD3DexmgConfig(RLPDDexmgConfig):
+    # ``dexmg`` keeps the published benchmark path.  ``marvin`` selects the
+    # single-robot Bridge adapter added in this branch.
+    environment_backend: str = "dexmg"
     actor_name: str | None = None  # Inferred from base policy config
 
     # ------------------------------------------------------------------
@@ -122,6 +126,58 @@ class ResidualTD3DexmgConfig(RLPDDexmgConfig):
 
     # Whether to run an evaluation pass before training begins (at step 0)
     eval_first: bool = True
+
+
+@dataclass
+class MarvinResidualTD3Config(ResidualTD3DexmgConfig):
+    environment_backend: str = "marvin"
+    task: str = "Insert the USB plug"
+    num_envs: int = 1
+    eval_num_envs: int = 1
+    eval_num_episodes: int = 1
+    rl_camera: list[str] = field(default_factory=lambda: [
+        "observation.images.side_policy",
+        "observation.images.wrist_1buchong",
+        "observation.images.wrist_1",
+        "observation.images.wrist_2",
+    ])
+    marvin: dict = field(default_factory=lambda: {
+        "base_policy_checkpoint": "",
+        "base_policy_chunk_size": 20,
+        "base_policy_n_action_steps": 5,
+        "marvin_root": "/home/xlb/code/强化微调ACT",
+        "device": "cuda",
+        "host": "127.0.0.1",
+        "port": 8765,
+        "max_steps": 200,
+        "residual_scale": None,
+        "contact_start_step": 0,
+        "enable_gripper_residual": False,
+        "allow_real_robot": False,
+        "replay_dir": "",
+        "residual_checkpoint": "",
+        "training_checkpoint_dir": "",
+        "resume_checkpoint": "",
+        "minimum_replay_transitions": 10_000,
+        "learner_only": False,
+        "learner_updates_per_run": 500,
+        "training_checkpoint_keep_last": 2,
+        "async_grpc": False,
+        "grpc_host": "127.0.0.1",
+        "grpc_port": 50051,
+        "grpc_parameter_push_s": 1.0,
+        "learner_gpu_memory_fraction": 0.8,
+        "actor_publish_interval": 50,
+        "learner_update_sleep_s": 0.01,
+    })
+    offline_data: OfflineDataConfig = field(
+        default_factory=lambda: OfflineDataConfig(
+            name="marvin_usb_rl",
+            root="/home/xlb/code/强化微调ACT/datasets/residual_v21/marvin_usb_rl",
+            num_episodes=807,
+            use_base_policy_for_base_actions=True,
+        )
+    )
 
 
 @dataclass
@@ -274,3 +330,4 @@ cs.store(name="residual_td3_square_config", node=ResidualTD3SquareConfig)
 cs.store(name="residual_td3_box_clean_config", node=ResidualTD3BoxCleanConfig)
 cs.store(name="residual_td3_coffee_config", node=ResidualTD3CoffeeConfig)
 cs.store(name="residual_td3_two_arm_cansort_config", node=ResidualTD3TwoArmCanSortConfig)
+cs.store(name="marvin_residual_td3_config", node=MarvinResidualTD3Config)

@@ -252,8 +252,13 @@ class QAgent(nn.Module):
         """This function takes tensor and returns actions in tensor"""
         assert not self.training
         assert not self.actor.training
-        # Make a shallow copy of the observation dict
-        obs = copy.copy(obs)
+        # Environment observations may intentionally live on CPU so replay
+        # transforms can append them. Move only this inference copy to the
+        # agent device; replay storage remains device-agnostic.
+        obs = {
+            key: value.to(self.cfg.device, non_blocking=True) if isinstance(value, torch.Tensor) else value
+            for key, value in obs.items()
+        }
         unsqueezed = self._maybe_unsqueeze_(obs)
 
         assert "feat" not in obs

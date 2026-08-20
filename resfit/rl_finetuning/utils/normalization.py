@@ -39,6 +39,8 @@ class ActionScaler:
         action_max: torch.Tensor,
         action_scale: float = 1.0,
         min_range_per_dim: float = 1e-1,
+        absolute_min: float | torch.Tensor | None = None,
+        absolute_max: float | torch.Tensor | None = None,
         device: torch.device | str = "cpu",
     ):
         """
@@ -70,10 +72,24 @@ class ActionScaler:
         # Expand the range by action_scale factor
         expanded_half_range = action_half_range * (1 + action_scale)
 
-        # Store the final limits
+        # Store the final limits. Some environments (Marvin in particular)
+        # expose commands that are already normalized to a hard physical
+        # action box. Dataset-range expansion must never exceed that box.
+        expanded_min = action_mid - expanded_half_range
+        expanded_max = action_mid + expanded_half_range
+        if (absolute_min is None) != (absolute_max is None):
+            raise ValueError("absolute_min and absolute_max must be provided together")
+        if absolute_min is not None:
+            hard_min = torch.as_tensor(absolute_min, dtype=action_min.dtype, device=self.device)
+            hard_max = torch.as_tensor(absolute_max, dtype=action_max.dtype, device=self.device)
+            expanded_min = torch.maximum(expanded_min, hard_min)
+            expanded_max = torch.minimum(expanded_max, hard_max)
+            if torch.any(expanded_min >= expanded_max):
+                raise ValueError("Absolute action bounds collapse one or more scaler dimensions")
+
         self._limits = self.Limits(
-            min=action_mid - expanded_half_range,
-            max=action_mid + expanded_half_range,
+            min=expanded_min,
+            max=expanded_max,
         )
 
         # Precompute range for efficiency (with safeguard)
@@ -150,6 +166,8 @@ class ActionScaler:
         action_stats: dict,
         action_scale: float = 1.0,
         min_range_per_dim: float = 1e-1,
+        absolute_min: float | torch.Tensor | None = None,
+        absolute_max: float | torch.Tensor | None = None,
         device: torch.device | str = "cpu",
     ) -> ActionScaler:
         """
@@ -172,6 +190,8 @@ class ActionScaler:
             action_max=action_max,
             action_scale=action_scale,
             min_range_per_dim=min_range_per_dim,
+            absolute_min=absolute_min,
+            absolute_max=absolute_max,
             device=device,
         )
 

@@ -17,9 +17,11 @@ os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 os.environ.setdefault("KMP_AFFINITY", "granularity=fine,compact,1,0")
 
 import hashlib
+import io
 import json
 import logging
 import pprint
+import queue
 import random
 import shutil
 import time
@@ -37,7 +39,7 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 from omegaconf import OmegaConf
 from tensordict import TensorDict
 from torch.utils.data import DataLoader
-from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictPrioritizedReplayBuffer
+from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictPrioritizedReplayBuffer, TensorDictReplayBuffer
 from tqdm import tqdm
 
 import wandb
@@ -59,6 +61,10 @@ from resfit.rl_finetuning.utils.hugging_face import (
 from resfit.rl_finetuning.utils.normalization import ActionScaler, StateStandardizer
 from resfit.rl_finetuning.utils.rb_transforms import MultiStepTransform
 from resfit.rl_finetuning.wrappers.residual_env_wrapper import BasePolicyVecEnvWrapper
+from resfit.rl_finetuning.marvin.env import MarvinACTBasePolicy, MarvinResidualConfig, MarvinResidualVecEnv
+from resfit.rl_finetuning.marvin.replay import atomic_write_episode, inspect_replay_directory, replay_identity
+from resfit.rl_finetuning.marvin.grpc_transport import start_learner_server
+from resfit.rl_finetuning.utils.checkpoint import save_checkpoint
 
 
 # -----------------------------------------------------------------------------
@@ -114,6 +120,47 @@ class TrainingTimer:
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _marvin_binary_reward(raw_reward: float) -> float:
+    """Match the user's Marvin task rule for old and new replay data."""
+    return 1.0 if float(raw_reward) > 0.8 else 0.0
+
+
+def _add_marvin_episode(data, replay_buffer) -> int:
+    size = len(data["reward"])
+    for row in range(size):
+        obs = {
+            "observation.state": torch.as_tensor(data["state"][row], dtype=torch.float32),
+            "observation.base_action": torch.as_tensor(data["base_action"][row], dtype=torch.float32),
+        }
+        next_obs = {
+            "observation.state": torch.as_tensor(data["next_state"][row], dtype=torch.float32),
+            "observation.base_action": torch.as_tensor(data["next_base_action"][row], dtype=torch.float32),
+        }
+        for camera in ("side_policy", "wrist_1buchong", "wrist_1", "wrist_2"):
+            obs[f"observation.images.{camera}"] = torch.as_tensor(data[f"image_{camera}"][row])
+            next_obs[f"observation.images.{camera}"] = torch.as_tensor(data[f"next_image_{camera}"][row])
+        done = torch.tensor(bool(data["terminated"][row] or data["truncated"][row]))
+        replay_buffer.add(TensorDict({
+            "obs": TensorDict(obs, batch_size=[]),
+            "action": torch.as_tensor(data["command_action"][row], dtype=torch.float32),
+            "next": TensorDict({
+                "obs": TensorDict(next_obs, batch_size=[]),
+                "done": done,
+                "reward": torch.tensor(_marvin_binary_reward(data["reward"][row])),
+            }, batch_size=[]),
+            "_priority": torch.tensor(10.0),
+        }, batch_size=[]).unsqueeze(0))
+    return size
+
 # -----------------------------------------------------------------------------
 # Hugging Face buffer cache helpers (global) ---------------------------------
 # -----------------------------------------------------------------------------
@@ -167,7 +214,9 @@ def _add_transitions_to_buffer(
         # Handle terminal observation (same logic as main loop)
         if done[i] and "final_obs" in info and info["final_obs"][i] is not None:
             final_obs_dict = info["final_obs"][i]
-            next_obs_i = {k: torch.as_tensor(v, device=device) for k, v in final_obs_dict.items()}
+            # Online n-step transforms keep their staging buffer on CPU.
+            # The agent moves sampled batches to CUDA later.
+            next_obs_i = {k: torch.as_tensor(v)[0].cpu() for k, v in final_obs_dict.items()}
         else:
             next_obs_i = {k: v[i] for k, v in next_obs.items()}
 
@@ -206,6 +255,13 @@ def main(cfg: ResidualTD3DexmgConfig):
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_str)
 
+    if cfg.environment_backend == "marvin" and device.type == "cuda":
+        gpu_fraction = float(cfg.marvin.get("learner_gpu_memory_fraction", 0.8))
+        if not 0.0 < gpu_fraction < 1.0:
+            raise ValueError("marvin.learner_gpu_memory_fraction must be in (0, 1)")
+        torch.cuda.set_per_process_memory_fraction(gpu_fraction, device=torch.cuda.current_device())
+        print(f"Marvin learner CUDA memory fraction: {gpu_fraction:.0%}")
+
     # Enable performance optimizations
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
@@ -216,37 +272,71 @@ def main(cfg: ResidualTD3DexmgConfig):
     # Load the behaviour-cloning policy that will serve as the "base" policy
     # for residual learning.
     # ---------------------------------------------------------------------
-    assert "base_policy" in cfg, "Base policy configuration is required"
-    policy_dir, _ = download_policy_from_wandb(
-        cfg.base_policy.wandb_id,
-        step=cfg.base_policy.wt_type,
-        artifact_version=cfg.base_policy.wt_version,
-    )
+    marvin_cfg = None
+    grpc_server = None
+    grpc_shutdown = None
+    grpc_parameters = None
+    grpc_transitions = None
+    if cfg.environment_backend == "marvin":
+        if cfg.offline_data is None or not cfg.offline_data.use_base_policy_for_base_actions:
+            raise ValueError(
+                "Marvin ResFiT requires offline_data.use_base_policy_for_base_actions=true: "
+                "the frozen ACT action must be stored as observation.base_action while the "
+                "demonstration action remains the executed replay action."
+            )
+        marvin_cfg = MarvinResidualConfig(**dict(cfg.marvin))
+        if marvin_cfg.async_grpc:
+            import threading
 
-    base_policy: ACTPolicy = load_policy(policy_dir)
-    base_policy.to(device)
-    base_policy.eval()
-    eval_base_policy: ACTPolicy = load_policy(policy_dir)
-    eval_base_policy.to(device)
-    eval_base_policy.eval()
+            grpc_shutdown = threading.Event()
+            grpc_parameters = queue.Queue(maxsize=1)
+            grpc_transitions = queue.Queue(maxsize=2)
+            grpc_server = start_learner_server(
+                host=marvin_cfg.grpc_host,
+                port=marvin_cfg.grpc_port,
+                parameters_queue=grpc_parameters,
+                transition_queue=grpc_transitions,
+                shutdown_event=grpc_shutdown,
+                push_frequency_s=marvin_cfg.grpc_parameter_push_s,
+            )
+        if not marvin_cfg.base_policy_checkpoint:
+            raise ValueError("marvin.base_policy_checkpoint is required")
+        base_policy = MarvinACTBasePolicy(marvin_cfg)
+        eval_base_policy = base_policy
+    else:
+        assert "base_policy" in cfg, "Base policy configuration is required"
+        policy_dir, _ = download_policy_from_wandb(
+            cfg.base_policy.wandb_id,
+            step=cfg.base_policy.wt_type,
+            artifact_version=cfg.base_policy.wt_version,
+        )
+        base_policy = load_policy(policy_dir)
+        base_policy.to(device)
+        base_policy.eval()
+        eval_base_policy = load_policy(policy_dir)
+        eval_base_policy.to(device)
+        eval_base_policy.eval()
 
     # Extract the configuration from base policy
-    base_cfg = base_policy.config
+    base_cfg = getattr(base_policy, "config", None)
 
-    if isinstance(base_cfg, ACTConfig):
+    if cfg.environment_backend == "marvin" or isinstance(base_cfg, ACTConfig):
         cfg.actor_name = "residual_act"
     else:
         raise ValueError(f"Unknown base policy type: {type(base_cfg)}")
 
     # Load dataset and get normalization functions early
     print("Loading dataset and setting up normalization...")
-    dataset = LeRobotDataset(cfg.offline_data.name)
+    dataset_kwargs = {"root": cfg.offline_data.root} if cfg.offline_data.root else {}
+    dataset = LeRobotDataset(cfg.offline_data.name, **dataset_kwargs)
 
     # Create action scaler from dataset statistics
     action_scaler = ActionScaler.from_dataset_stats(
         action_stats=dataset.meta.stats["action"],
         action_scale=cfg.agent.actor.action_scale,
         min_range_per_dim=cfg.offline_data.min_action_range,
+        absolute_min=-1.0 if cfg.environment_backend == "marvin" else None,
+        absolute_max=1.0 if cfg.environment_backend == "marvin" else None,
         device=device,
     )
 
@@ -256,6 +346,18 @@ def main(cfg: ResidualTD3DexmgConfig):
         min_std=cfg.offline_data.min_state_std,
         device=device,
     )
+    marvin_replay_identity = None
+    if cfg.environment_backend == "marvin":
+        marvin_replay_identity = replay_identity(
+            base_policy_checkpoint=marvin_cfg.base_policy_checkpoint,
+            base_policy_chunk_size=marvin_cfg.base_policy_chunk_size,
+            base_policy_n_action_steps=marvin_cfg.base_policy_n_action_steps,
+            offline_dataset_root=cfg.offline_data.root,
+            offline_dataset_name=cfg.offline_data.name,
+            actor_action_scale=cfg.agent.actor.action_scale,
+            min_action_range=cfg.offline_data.min_action_range,
+            min_state_std=cfg.offline_data.min_state_std,
+        )
 
     def get_envs(
         env_name: str,
@@ -269,6 +371,14 @@ def main(cfg: ResidualTD3DexmgConfig):
     ):
         assert action_scaler is not None, "action_scaler must be provided for consistent normalization"
         assert state_standardizer is not None, "state_standardizer must be provided for consistent normalization"
+
+        if cfg.environment_backend == "marvin":
+            return MarvinResidualVecEnv(
+                marvin_cfg,
+                base_policy=base_policy,
+                action_scaler=action_scaler,
+                state_standardizer=state_standardizer,
+            )
 
         # Create the vectorized environment
         vec_env = create_vectorized_env(
@@ -311,7 +421,8 @@ def main(cfg: ResidualTD3DexmgConfig):
     # Environment setup ----------------------------------------------------
     # ---------------------------------------------------------------------
     assert cfg.num_envs == 1, "Only support 1 environment for now because of how n_step is implemented"
-    env = get_envs(
+    learner_only = bool(cfg.environment_backend == "marvin" and marvin_cfg.learner_only)
+    env = None if learner_only else get_envs(
         env_name=cfg.task,
         num_envs=cfg.num_envs,
         base_policy=base_policy,
@@ -325,7 +436,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     num_cpus_available = os.cpu_count() - 1 if os.cpu_count() is not None else 1
     cfg.eval_num_envs = min(num_cpus_available, cfg.eval_num_envs)
 
-    eval_env = get_envs(
+    eval_env = None if learner_only else env if cfg.environment_backend == "marvin" else get_envs(
         env_name=cfg.task,
         num_envs=cfg.eval_num_envs,
         base_policy=eval_base_policy,
@@ -337,9 +448,9 @@ def main(cfg: ResidualTD3DexmgConfig):
     )
 
     # Seed environments explicitly for reproducibility
-    if hasattr(env, "seed"):
+    if env is not None and hasattr(env, "seed"):
         env.seed(cfg.seed)
-    if hasattr(eval_env, "seed"):
+    if eval_env is not None and hasattr(eval_env, "seed"):
         eval_env.seed(cfg.seed + 1)  # Use different seed for eval env to avoid correlation
 
     # ---------------------------------------------------------------------
@@ -353,9 +464,17 @@ def main(cfg: ResidualTD3DexmgConfig):
     else:
         image_keys = list(cfg.rl_camera)
     assert isinstance(image_keys, list)
-    lowdim_dim = env.observation_space["observation.state"].shape[1]
-    img_c, img_h, img_w = env.observation_space[image_keys[0]].shape[1:]
-    action_dim = env.action_space.shape[1]
+    if learner_only:
+        lowdim_dim = 24
+        img_c, img_h, img_w = (3, 128, 128)
+        action_dim = 5
+        horizon = int(marvin_cfg.max_steps)
+        print("Marvin learner-only mode: Bridge/environment construction is disabled")
+    else:
+        lowdim_dim = env.observation_space["observation.state"].shape[1]
+        img_c, img_h, img_w = env.observation_space[image_keys[0]].shape[1:]
+        action_dim = env.action_space.shape[1]
+        horizon = env.vec_env.metadata["horizon"]
 
     lowdim_keys = ["observation.state", "observation.base_action"]
 
@@ -370,10 +489,41 @@ def main(cfg: ResidualTD3DexmgConfig):
         cfg=cfg.agent,
         residual_actor=True,  # Enable residual actor mode
     )
-    horizon = env.vec_env.metadata["horizon"]
 
     # Set up actor learning rate warmup
     actor_updates = 0
+    initial_global_step = 0
+    critic_warmup_completed = False
+    if cfg.environment_backend == "marvin" and marvin_cfg.resume_checkpoint:
+        resume_spec = str(marvin_cfg.resume_checkpoint)
+        resume_path = (
+            Path(marvin_cfg.training_checkpoint_dir).expanduser().resolve() / "latest.pt"
+            if resume_spec == "auto"
+            else Path(resume_spec).expanduser().resolve()
+        )
+        if resume_spec == "auto" and not resume_path.is_file():
+            resume_path = None
+    else:
+        resume_path = None
+    if resume_path is not None:
+        bundle = torch.load(resume_path, map_location=device, weights_only=False)
+        if bundle.get("base_policy_sha256") != marvin_replay_identity["base_policy_sha256"]:
+            raise ValueError("Resume checkpoint was trained with a different ACT base policy")
+        if bundle.get("action_contract") != marvin_replay_identity["action_contract"]:
+            raise ValueError("Resume checkpoint uses a different Marvin action contract")
+        agent.load_state_dict(bundle["agent_state_dict"])
+        optimizer_states = bundle.get("optimizer_state_dict", {})
+        for name, optimizer in (
+            ("actor_opt", agent.actor_opt),
+            ("critic_opt", agent.critic_opt),
+            ("encoder_opt", agent.encoder_opt),
+        ):
+            if name in optimizer_states:
+                optimizer.load_state_dict(optimizer_states[name])
+        initial_global_step = int(bundle["global_step"])
+        actor_updates = int(bundle.get("actor_updates", 0))
+        critic_warmup_completed = bool(bundle.get("critic_warmup_completed", False))
+        print(f"Resumed Marvin learner from {resume_path} at global_step={initial_global_step}")
     if cfg.algo.actor_lr_warmup_steps > 0:
         print(
             f"Actor LR warmup enabled: 0.0 -> {cfg.agent.actor_lr:.2e} "
@@ -383,10 +533,8 @@ def main(cfg: ResidualTD3DexmgConfig):
     # ---------------------------------------------------------------------
     # Replay buffers -------------------------------------------------------
     # ---------------------------------------------------------------------
-    # -----------------------------------------------------------------
-    # Use TensorDictPrioritizedReplayBuffer for unified PER support
-    # For uniform sampling, we'll use alpha=0 and beta=0, and never update priorities
-    # -----------------------------------------------------------------
+    # Prioritized replay needs TorchRL's optional C++ segment-tree extension;
+    # the published/default uniform path uses the portable random sampler.
     alpha = cfg.algo.priority_alpha if cfg.algo.sampling_strategy == "prioritized_replay" else 0.0
     beta = cfg.algo.priority_beta if cfg.algo.sampling_strategy == "prioritized_replay" else 0.0
 
@@ -396,18 +544,25 @@ def main(cfg: ResidualTD3DexmgConfig):
     if cfg.algo.offline_fraction == 0.0:
         print("Online-only training mode: offline_fraction=0.0")
 
-    # Use TensorDictPrioritizedReplayBuffer with optimized prefetching
-    online_rb = TensorDictPrioritizedReplayBuffer(
-        storage=LazyTensorStorage(max_size=cfg.algo.buffer_size, device="cpu"),
-        alpha=alpha,
-        beta=beta,
-        eps=1e-6,  # Small epsilon added to priorities to prevent zero values
-        priority_key="_priority",
-        transform=MultiStepTransform(n_steps=cfg.algo.n_step, gamma=cfg.algo.gamma),
-        pin_memory=True,
-        prefetch=cfg.algo.prefetch_batches,  # Add prefetching
-        batch_size=online_batch_size,
-    )
+    def _make_replay_buffer(max_size: int, batch_size: int) -> ReplayBuffer:
+        common_kwargs = {
+            "storage": LazyTensorStorage(max_size=max_size, device="cpu"),
+            "transform": MultiStepTransform(n_steps=cfg.algo.n_step, gamma=cfg.algo.gamma),
+            "pin_memory": True,
+            "prefetch": cfg.algo.prefetch_batches,
+            "batch_size": batch_size,
+        }
+        if cfg.algo.sampling_strategy == "prioritized_replay":
+            return TensorDictPrioritizedReplayBuffer(
+                alpha=alpha,
+                beta=beta,
+                eps=1e-6,
+                priority_key="_priority",
+                **common_kwargs,
+            )
+        return TensorDictReplayBuffer(**common_kwargs)
+
+    online_rb = _make_replay_buffer(cfg.algo.buffer_size, online_batch_size)
 
     # ------------------------------------------------------------------
     # Caching layer for online replay buffer ----------------------------
@@ -444,19 +599,57 @@ def main(cfg: ResidualTD3DexmgConfig):
 
     # Attempt to download/extract from HF every run (no-op if already cached)
     dl_dir = None
-    if ONLINE_HF_REPO is not None:
+    if ONLINE_HF_REPO is not None and cfg.environment_backend != "marvin":
         print(f"Attempting to download online buffer {online_cache_hash} from {ONLINE_HF_REPO}...")
         dl_dir = _hf_download_buffer(ONLINE_HF_REPO, online_cache_hash, ONLINE_CACHE_DIR)
     if dl_dir is not None:
         online_cache_dir = dl_dir
 
     loaded_online_from_cache = False
-    if online_cache_dir.exists():
+    known_marvin_episode_ids: set[int] = set()
+    marvin_episode_count = 0
+    marvin_transition_count = 0
+    marvin_success_count = 0
+    if cfg.environment_backend != "marvin" and online_cache_dir.exists():
         print(f"{online_cache_dir} found on disk. Attempting to load...")
         online_rb.sampler._empty()
         optimized_replay_buffer_loads(online_rb, online_cache_dir)
         loaded_online_from_cache = True
         print(f"Loaded online buffer from cache at {online_cache_dir} (size={len(online_rb)})")
+
+    # Marvin collector writes an auditable NPZ interchange format.  Import it
+    # only for the Marvin backend; published DexMimicGen runs keep their cache
+    # behavior unchanged.
+    if cfg.environment_backend == "marvin" and not loaded_online_from_cache:
+        replay_dir = str(marvin_cfg.replay_dir or "")
+        if not replay_dir:
+            raise ValueError("marvin.replay_dir is required")
+        replay_root = Path(replay_dir)
+        replay_episodes, raw_replay_transitions, next_replay_episode_id = inspect_replay_directory(
+            replay_root, marvin_replay_identity
+        )
+        for episode_path, _manifest in replay_episodes:
+            known_marvin_episode_ids.add(int(_manifest["episode_id"]))
+            marvin_episode_count += 1
+            marvin_transition_count += int(_manifest["transitions"])
+            marvin_success_count += int(bool(_manifest.get("success", False)))
+            with np.load(episode_path, allow_pickle=False) as data:
+                _add_marvin_episode(data, online_rb)
+        loaded_online_from_cache = len(online_rb) > 0
+        print(
+            f"Loaded Marvin NPZ replay from {replay_root} "
+            f"(raw_transitions={raw_replay_transitions}, buffer_size={len(online_rb)})"
+        )
+        required_replay = max(
+            int(cfg.algo.learning_starts),
+            int(marvin_cfg.minimum_replay_transitions),
+            int(online_batch_size),
+        )
+        if len(online_rb) < required_replay:
+            raise RuntimeError(
+                f"Marvin replay is too small after n-step conversion: {len(online_rb)} < {required_replay}. "
+                "Continue the formal zero-residual collection before starting the learner."
+            )
 
     # Offline data is required for normalization, but can be unused for training if offline_fraction=0
     assert cfg.offline_data is not None and cfg.offline_data.num_episodes is not None
@@ -493,17 +686,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     else:
         print("Online-only mode: creating minimal offline buffer (unused)")
 
-    offline_rb = TensorDictPrioritizedReplayBuffer(
-        storage=LazyTensorStorage(max_size=max_offline_transitions, device="cpu"),
-        alpha=alpha,
-        beta=beta,
-        eps=1e-6,  # Small epsilon added to priorities to prevent zero values
-        priority_key="_priority",
-        transform=MultiStepTransform(n_steps=cfg.algo.n_step, gamma=cfg.algo.gamma),
-        pin_memory=True,
-        prefetch=cfg.algo.prefetch_batches,  # Add prefetching
-        batch_size=max(offline_batch_size, 1),  # Ensure batch_size is at least 1
-    )
+    offline_rb = _make_replay_buffer(max_offline_transitions, max(offline_batch_size, 1))
 
     # Normalization functions already defined above - use them
 
@@ -543,11 +726,17 @@ def main(cfg: ResidualTD3DexmgConfig):
         episode_cache: dict[int, dict] = {}
         transitions = 0
         step_id = 0
+        last_ep_idx: int | None = None
 
         for sample in tqdm(loader, desc="Processing offline dataset"):
             ep_idx = int(sample["episode_index"].item())
             if num_episodes is not None and ep_idx == num_episodes:
                 break
+            if use_base_policy_for_base_actions and ep_idx != last_ep_idx:
+                # Match online execution: an ACT action queue never crosses an
+                # episode boundary.
+                base_policy.reset()
+            last_ep_idx = ep_idx
 
             # ------------------------------------------------------------------
             # Build observation and action directly for replay buffer ----------
@@ -556,6 +745,12 @@ def main(cfg: ResidualTD3DexmgConfig):
             _gt_action: torch.Tensor = sample["action"].float().squeeze(0)
             gt_action_scaled = action_scaler.scale(_gt_action)
             done_flag = bool(sample["next.done"].item())
+            raw_reward_value = sample.get("rl.reward", sample.get("reward", None))
+            if raw_reward_value is None:
+                raw_reward = float(done_flag)
+            else:
+                raw_reward = float(torch.as_tensor(raw_reward_value).reshape(-1)[0].item())
+            binary_reward = _marvin_binary_reward(raw_reward) if cfg.environment_backend == "marvin" else float(done_flag)
 
             # Generate base action based on the selected mode
             if use_base_policy_for_base_actions:
@@ -601,7 +796,7 @@ def main(cfg: ResidualTD3DexmgConfig):
                             {
                                 "obs": TensorDict(curr_obs, batch_size=[]),
                                 "done": torch.tensor(done_flag, dtype=torch.bool),
-                                "reward": torch.tensor(float(done_flag), dtype=torch.float32),
+                                "reward": torch.tensor(binary_reward, dtype=torch.float32),
                             },
                             batch_size=[],
                         ),
@@ -652,6 +847,21 @@ def main(cfg: ResidualTD3DexmgConfig):
         "torchrl_version": torchrl.__version__,
         "tensordict_version": tensordict.__version__,
     }
+    if cfg.environment_backend == "marvin":
+        checkpoint_root = Path(marvin_cfg.base_policy_checkpoint).expanduser().resolve()
+        if (checkpoint_root / "policy" / "config.json").is_file():
+            checkpoint_root = checkpoint_root / "policy"
+        weight_candidates = [checkpoint_root / "model.safetensors", checkpoint_root / "pytorch_model.bin"]
+        weight_path = next((path for path in weight_candidates if path.is_file()), None)
+        if weight_path is None:
+            raise FileNotFoundError(f"No ACT weight file found in {checkpoint_root}")
+        offline_cache_meta["base_policy_checkpoint"] = str(checkpoint_root)
+        offline_cache_meta["base_policy_sha256"] = _sha256_file(weight_path)
+        offline_cache_meta["action_contract"] = marvin_replay_identity["action_contract"]
+        offline_cache_meta["command_bounds"] = marvin_replay_identity["command_bounds"]
+        offline_cache_meta["offline_dataset_stats_sha256"] = marvin_replay_identity[
+            "offline_dataset_stats_sha256"
+        ]
     if cfg.algo.sampling_strategy == "prioritized_replay":
         offline_cache_meta["priority_alpha"] = cfg.algo.priority_alpha
         offline_cache_meta["priority_beta"] = cfg.algo.priority_beta
@@ -716,6 +926,11 @@ def main(cfg: ResidualTD3DexmgConfig):
     # ------------------------------------------------------------------
 
     if len(online_rb) < cfg.algo.learning_starts and not loaded_online_from_cache:
+        if cfg.environment_backend == "marvin":
+            raise RuntimeError(
+                "Marvin training refuses automatic random warm-up. Collect a bounded ACT/residual replay "
+                "with the Marvin collector and place/load it before starting the learner."
+            )
         print(f"Warm-up: filling online buffer with {cfg.algo.learning_starts - len(online_rb)} random steps…")
         obs, _ = env.reset()
         # --------------------------------------------------------------
@@ -840,7 +1055,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     )
 
     # Log horizon to wandb summary
-    wandb.summary["environment/horizon"] = env.vec_env.metadata["horizon"]
+    wandb.summary["environment/horizon"] = horizon
 
     # Create a timestamped folder in CACHE_DIR for all outputs
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -852,9 +1067,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     model_save_dir.mkdir(parents=True, exist_ok=True)
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
-    obs, _ = env.reset()
-
-    global_step = 0
+    global_step = initial_global_step
     best_eval_success_rate = 0.0
     training_cum_time = 0.0
     episode_count = 0
@@ -918,11 +1131,84 @@ def main(cfg: ResidualTD3DexmgConfig):
                     f"train/critic_qt={metrics['train/critic_qt']:.4f} "
                     f"train/critic_loss={metrics['train/critic_loss']:.4f}"
                 )
+                wandb.log({
+                    "warmup/update": i,
+                    "warmup/critic_qt": metrics["train/critic_qt"],
+                    "warmup/critic_loss": metrics["train/critic_loss"],
+                })
+
+    checkpoint_dir = None
+    if cfg.environment_backend == "marvin":
+        if not marvin_cfg.training_checkpoint_dir or not marvin_cfg.residual_checkpoint:
+            raise ValueError("Formal Marvin training requires checkpoint and deployment output paths")
+        checkpoint_dir = Path(marvin_cfg.training_checkpoint_dir).expanduser().resolve()
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    def _publish_marvin_actor(step: int) -> None:
+        if cfg.environment_backend != "marvin":
+            return
+        bundle = {
+            "actor": agent.actor.state_dict(),
+            "encoders": agent.encoders.state_dict(),
+            "obs_shape": (img_c, img_h, img_w),
+            "prop_shape": (lowdim_dim,),
+            "action_dim": action_dim,
+            "rl_cameras": list(image_keys),
+            "actor_action_scale": float(cfg.agent.actor.action_scale),
+            "global_step": step,
+            "base_policy_sha256": marvin_replay_identity["base_policy_sha256"],
+            "action_contract": marvin_replay_identity["action_contract"],
+        }
+        deployment_path = Path(marvin_cfg.residual_checkpoint).expanduser().resolve()
+        deployment_path.parent.mkdir(parents=True, exist_ok=True)
+        deployment_tmp = deployment_path.with_name(f".{deployment_path.name}.tmp")
+        torch.save(bundle, deployment_tmp)
+        os.replace(deployment_tmp, deployment_path)
+        if grpc_parameters is not None:
+            buffer = io.BytesIO()
+            torch.save(bundle, buffer)
+            try:
+                while True:
+                    grpc_parameters.get_nowait()
+            except queue.Empty:
+                pass
+            grpc_parameters.put_nowait(buffer.getvalue())
+
+    def _save_marvin_state(step: int) -> None:
+        if cfg.environment_backend != "marvin":
+            return
+        step_path = checkpoint_dir / f"step_{step:08d}.pt"
+        tmp_step_path = checkpoint_dir / f".step_{step:08d}.pt.tmp"
+        save_checkpoint(
+            agent,
+            tmp_step_path,
+            step,
+            config=cfg,
+            actor_updates=actor_updates,
+            critic_warmup_completed=critic_warmup_completed,
+            base_policy_sha256=marvin_replay_identity["base_policy_sha256"],
+            action_contract=marvin_replay_identity["action_contract"],
+        )
+        os.replace(tmp_step_path, step_path)
+        latest_tmp = checkpoint_dir / ".latest.pt.tmp"
+        shutil.copy2(step_path, latest_tmp)
+        os.replace(latest_tmp, checkpoint_dir / "latest.pt")
+
+        keep_last = int(marvin_cfg.training_checkpoint_keep_last)
+        if keep_last <= 0:
+            raise ValueError("marvin.training_checkpoint_keep_last must be positive")
+        numbered_checkpoints = sorted(checkpoint_dir.glob("step_*.pt"))
+        for stale_checkpoint in numbered_checkpoints[:-keep_last]:
+            stale_checkpoint.unlink()
+
+        _publish_marvin_actor(step)
+        print(f"Saved formal Marvin checkpoint step={step}: {step_path}")
 
     # ------------------------------------------------------------------
     # Critic warmup phase ----------------------------------------------
     # ------------------------------------------------------------------
-    if cfg.algo.critic_warmup_steps > 0:
+    critic_warmup_ran = False
+    if cfg.algo.critic_warmup_steps > 0 and not critic_warmup_completed:
         print(f"Critic warmup: running {cfg.algo.critic_warmup_steps} critic-only updates...")
         _run_critic_warmup(
             agent=agent,
@@ -934,9 +1220,136 @@ def main(cfg: ResidualTD3DexmgConfig):
             online_batch_size=online_batch_size,
             offline_batch_size=offline_batch_size,
         )
+        critic_warmup_completed = True
+        critic_warmup_ran = True
         print("Critic warmup completed.")
 
-    while global_step <= cfg.algo.total_timesteps:
+    # Persist the warmed critic and optimizer state before any hardware RPC.
+    # A Bridge startup/reset failure must never force the warmup to be repeated.
+    if cfg.environment_backend == "marvin" and (
+        critic_warmup_ran or (initial_global_step == 0 and cfg.algo.critic_warmup_steps == 0)
+    ):
+        _save_marvin_state(global_step)
+
+    if learner_only:
+        requested_updates = int(marvin_cfg.learner_updates_per_run)
+        if requested_updates <= 0:
+            raise ValueError("marvin.learner_updates_per_run must be positive")
+        if marvin_cfg.actor_publish_interval <= 0:
+            raise ValueError("marvin.actor_publish_interval must be positive")
+        continuous = bool(marvin_cfg.async_grpc)
+        learner_start_time = time.perf_counter()
+        online_episodes_total = marvin_episode_count
+        online_transitions_total = marvin_transition_count
+        online_successes_total = marvin_success_count
+
+        def _drain_grpc_transitions() -> int:
+            nonlocal online_episodes_total, online_transitions_total, online_successes_total
+            added = 0
+            if grpc_transitions is None:
+                return added
+            while True:
+                try:
+                    payload = grpc_transitions.get_nowait()
+                except queue.Empty:
+                    return added
+                episode = torch.load(io.BytesIO(payload), map_location="cpu", weights_only=True)
+                episode_id = int(episode.pop("_episode_id").item())
+                if episode_id in known_marvin_episode_ids:
+                    continue
+                episode_transitions = _add_marvin_episode(episode, online_rb)
+                added += episode_transitions
+                online_episodes_total += 1
+                online_transitions_total += episode_transitions
+                online_successes_total += int(torch.as_tensor(episode["success"]).any().item())
+                known_marvin_episode_ids.add(episode_id)
+
+        while global_step < cfg.algo.total_timesteps:
+            round_updates = min(requested_updates, cfg.algo.total_timesteps - global_step)
+            print(
+                "Starting Marvin learner round: "
+                f"updates={round_updates}, UTD={cfg.algo.num_updates_per_iteration}, "
+                f"online_buffer={len(online_rb)}, offline_buffer={len(offline_rb)}, grpc={continuous}"
+            )
+            for _learner_step in range(round_updates):
+                added = _drain_grpc_transitions()
+                if added:
+                    print(f"Received {added} online transitions over gRPC; online_buffer={len(online_rb)}")
+                stddev = utils.schedule(cfg.algo.stddev_schedule, global_step)
+                actor_update_cadence = (
+                    cfg.algo.num_updates_per_iteration // cfg.algo.actor_updates_per_iteration
+                )
+                for update_index in range(cfg.algo.num_updates_per_iteration):
+                    online_batch = online_rb.sample(online_batch_size).to(device, non_blocking=True)
+                    if cfg.algo.offline_fraction > 0.0:
+                        offline_batch = offline_rb.sample(offline_batch_size).to(device, non_blocking=True)
+                        batch = torch.cat([online_batch, offline_batch], dim=0)
+                    else:
+                        batch = online_batch
+                    update_actor = (update_index + 1) % actor_update_cadence == 0
+                    if update_actor:
+                        actor_updates += 1
+                    metrics = agent.update(batch, stddev, update_actor, bc_batch=None, ref_agent=agent)
+                global_step += 1
+                if global_step % cfg.log_freq == 0:
+                    elapsed = max(time.perf_counter() - learner_start_time, 1e-6)
+                    log_dict = {
+                        "training/global_step": global_step,
+                        "training/actor_updates": actor_updates,
+                        "training/actor_lr": agent.actor_opt.param_groups[0]["lr"],
+                        "learner/steps_per_second": (global_step - initial_global_step) / elapsed,
+                        "buffer/online_size": len(online_rb),
+                        "buffer/offline_size": len(offline_rb),
+                        "online/episodes_total": online_episodes_total,
+                        "online/transitions_total": online_transitions_total,
+                        "online/success_rate": (
+                            online_successes_total / online_episodes_total
+                            if online_episodes_total
+                            else 0.0
+                        ),
+                    }
+                    log_dict.update({k: v for k, v in metrics.items() if not k.startswith("_")})
+                    if "_actions" in metrics:
+                        actions = metrics["_actions"]
+                        log_dict["train/residual_l1_magnitude"] = torch.mean(torch.abs(actions)).item()
+                        log_dict["train/residual_l2_magnitude"] = torch.mean(torch.square(actions)).item()
+                        log_dict["train/residual_saturation_fraction"] = torch.mean(
+                            (torch.abs(actions) >= 0.9 * cfg.agent.actor.action_scale).float()
+                        ).item()
+                    wandb.log(log_dict, step=global_step)
+                    print(
+                        f"[learner {global_step}] critic_loss={metrics['train/critic_loss']:.4f} "
+                        f"actor_loss={metrics.get('train/actor_loss_base', float('nan')):.4f} "
+                        f"actor_updates={actor_updates}"
+                    )
+                if global_step % int(marvin_cfg.actor_publish_interval) == 0:
+                    _publish_marvin_actor(global_step)
+                if cfg.checkpoint_interval > 0 and global_step % cfg.checkpoint_interval == 0:
+                    _save_marvin_state(global_step)
+                if marvin_cfg.learner_update_sleep_s > 0:
+                    time.sleep(marvin_cfg.learner_update_sleep_s)
+            if not continuous:
+                if cfg.checkpoint_interval <= 0 or global_step % cfg.checkpoint_interval != 0:
+                    _save_marvin_state(global_step)
+                break
+        print(f"Marvin learner finished: global_step={global_step}, actor_updates={actor_updates}")
+        if grpc_shutdown is not None:
+            grpc_shutdown.set()
+            grpc_server.stop(10)
+        return
+
+    # Reset only after the potentially long critic warmup. This guarantees
+    # the first command is computed from a fresh robot observation.
+    obs, _ = env.reset()
+
+    next_checkpoint_step = (
+        ((global_step // cfg.checkpoint_interval) + 1) * cfg.checkpoint_interval
+        if cfg.checkpoint_interval > 0
+        else None
+    )
+    pending_replay_rows: list[dict] = []
+
+    while global_step < cfg.algo.total_timesteps:
         iter_start = time.time()
         # ------------------------------------------------------------------
         # (1) Collect action + Environment step ---------------------------
@@ -952,6 +1365,35 @@ def main(cfg: ResidualTD3DexmgConfig):
 
             next_obs, reward, terminated, truncated, info = env.step(action)
             done = terminated | truncated
+            if cfg.environment_backend == "marvin":
+                transition_next_obs = (
+                    info["final_obs"][0]
+                    if bool(done[0]) and info.get("final_obs", [None])[0] is not None
+                    else next_obs
+                )
+                pending_replay_rows.append({
+                    "state": obs["observation.state"][0].detach().cpu().numpy(),
+                    "next_state": transition_next_obs["observation.state"][0].detach().cpu().numpy(),
+                    "base_action": obs["observation.base_action"][0].detach().cpu().numpy(),
+                    "next_base_action": transition_next_obs["observation.base_action"][0].detach().cpu().numpy(),
+                    "residual_action": info["residual_action"][0].detach().cpu().numpy(),
+                    "command_action": info["scaled_action"][0].detach().cpu().numpy(),
+                    "actual_action": np.asarray(info["actual_action"], dtype=np.float32),
+                    "raw_reward": float(info.get("raw_reward", reward[0])),
+                    "reward": float(reward[0]),
+                    "success": bool(float(reward[0]) > 0.8),
+                    "terminated": bool(terminated[0]),
+                    "truncated": bool(truncated[0]),
+                    **{
+                        f"image_{camera}": obs[f"observation.images.{camera}"][0].detach().cpu().numpy()
+                        for camera in ("side_policy", "wrist_1buchong", "wrist_1", "wrist_2")
+                    },
+                    **{
+                        f"next_image_{camera}": transition_next_obs[f"observation.images.{camera}"][0]
+                        .detach().cpu().numpy()
+                        for camera in ("side_policy", "wrist_1buchong", "wrist_1", "wrist_2")
+                    },
+                })
         if done.any():
             episode_count += done.float().sum().item()
             # Extract episode information from final_info
@@ -995,7 +1437,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         # ------------------------------------------------------------------
         # (3) Periodic evaluation ------------------------------------------
         # ------------------------------------------------------------------
-        if global_step % cfg.eval_interval_every_steps == 0 and (cfg.eval_first or global_step > 0):
+        if cfg.environment_backend != "marvin" and global_step % cfg.eval_interval_every_steps == 0 and (cfg.eval_first or global_step > 0):
             with training_timer.time("evaluation"):
                 eval_metrics = run_dexmg_evaluation(
                     env=eval_env,
@@ -1087,6 +1529,34 @@ def main(cfg: ResidualTD3DexmgConfig):
 
                 i += 1
 
+        if cfg.environment_backend == "marvin" and bool(done[0]):
+            arrays = {
+                key: np.asarray([row[key] for row in pending_replay_rows])
+                for key in pending_replay_rows[0]
+            }
+            manifest = {
+                **marvin_replay_identity,
+                "episode_id": next_replay_episode_id,
+                "transitions": len(pending_replay_rows),
+                "source": "residual_td3_learner",
+                "residual_checkpoint": str(Path(marvin_cfg.residual_checkpoint).expanduser().resolve()),
+                "residual_scale": marvin_cfg.residual_scale,
+                "success": bool(any(row["success"] for row in pending_replay_rows)),
+                "training_global_step_end": global_step,
+            }
+            atomic_write_episode(replay_root, next_replay_episode_id, arrays, manifest)
+            print(
+                f"Persisted online Marvin episode={next_replay_episode_id} "
+                f"transitions={len(pending_replay_rows)}"
+            )
+            next_replay_episode_id += 1
+            pending_replay_rows = []
+            if next_checkpoint_step is not None and global_step >= next_checkpoint_step:
+                _save_marvin_state(global_step)
+                next_checkpoint_step = (
+                    (global_step // cfg.checkpoint_interval) + 1
+                ) * cfg.checkpoint_interval
+
         training_cum_time += time.time() - iter_start
 
         # ------------------------------------------------------------------
@@ -1177,10 +1647,32 @@ def main(cfg: ResidualTD3DexmgConfig):
 
             print(print_msg)
 
+    if cfg.environment_backend == "marvin":
+        _save_marvin_state(global_step)
+
     print(f"Training finished in {time.time() - train_start_time:.2f} seconds.")
 
+    # Persist an actor+vision-encoder bundle for the standalone Marvin online
+    # collector.  This is opt-in so published benchmark runs are unchanged.
+    if cfg.environment_backend == "marvin" and cfg.marvin.get("residual_checkpoint") and checkpoint_dir is None:
+        checkpoint_path = Path(str(cfg.marvin["residual_checkpoint"])).expanduser()
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "actor": agent.actor.state_dict(),
+                "encoders": agent.encoders.state_dict(),
+                "obs_shape": (img_c, img_h, img_w),
+                "prop_shape": (lowdim_dim,),
+                "action_dim": action_dim,
+                "rl_cameras": list(image_keys),
+                "actor_action_scale": float(cfg.agent.actor.action_scale),
+            },
+            checkpoint_path,
+        )
+        print(f"Saved Marvin residual actor checkpoint to {checkpoint_path}")
+
     # Clean up entire run directory after successful completion (videos/logs are saved to wandb)
-    if run_cache_dir.exists():
+    if run_cache_dir.exists() and cfg.environment_backend != "marvin":
         print(f"Cleaning up run directory: {run_cache_dir}")
         shutil.rmtree(run_cache_dir)
         print("Run directory cleaned up successfully.")
