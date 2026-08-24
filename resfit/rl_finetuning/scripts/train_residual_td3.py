@@ -35,11 +35,17 @@ import numpy as np
 import tensordict
 import torch
 import torchrl
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from omegaconf import OmegaConf
 from tensordict import TensorDict
 from torch.utils.data import DataLoader
-from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictPrioritizedReplayBuffer, TensorDictReplayBuffer
+from torchrl.data import (
+    LazyMemmapStorage,
+    LazyTensorStorage,
+    ReplayBuffer,
+    TensorDictPrioritizedReplayBuffer,
+    TensorDictReplayBuffer,
+)
 from tqdm import tqdm
 
 import wandb
@@ -62,7 +68,15 @@ from resfit.rl_finetuning.utils.normalization import ActionScaler, StateStandard
 from resfit.rl_finetuning.utils.rb_transforms import MultiStepTransform
 from resfit.rl_finetuning.wrappers.residual_env_wrapper import BasePolicyVecEnvWrapper
 from resfit.rl_finetuning.marvin.env import MarvinACTBasePolicy, MarvinResidualConfig, MarvinResidualVecEnv
-from resfit.rl_finetuning.marvin.replay import atomic_write_episode, inspect_replay_directory, replay_identity
+from resfit.rl_finetuning.marvin.replay import (
+    atomic_write_episode,
+    cached_episode_ids,
+    inspect_replay_directory,
+    manifest_sha1,
+    recover_pending_cache_metadata,
+    replay_identity,
+    replay_manifest_fingerprint,
+)
 from resfit.rl_finetuning.marvin.grpc_transport import start_learner_server
 from resfit.rl_finetuning.utils.checkpoint import save_checkpoint
 
@@ -137,29 +151,33 @@ def _marvin_binary_reward(raw_reward: float) -> float:
 def _add_marvin_episode(data, replay_buffer) -> int:
     size = len(data["reward"])
     for row in range(size):
-        obs = {
-            "observation.state": torch.as_tensor(data["state"][row], dtype=torch.float32),
-            "observation.base_action": torch.as_tensor(data["base_action"][row], dtype=torch.float32),
-        }
-        next_obs = {
-            "observation.state": torch.as_tensor(data["next_state"][row], dtype=torch.float32),
-            "observation.base_action": torch.as_tensor(data["next_base_action"][row], dtype=torch.float32),
-        }
-        for camera in ("side_policy", "wrist_1buchong", "wrist_1", "wrist_2"):
-            obs[f"observation.images.{camera}"] = torch.as_tensor(data[f"image_{camera}"][row])
-            next_obs[f"observation.images.{camera}"] = torch.as_tensor(data[f"next_image_{camera}"][row])
-        done = torch.tensor(bool(data["terminated"][row] or data["truncated"][row]))
-        replay_buffer.add(TensorDict({
-            "obs": TensorDict(obs, batch_size=[]),
-            "action": torch.as_tensor(data["command_action"][row], dtype=torch.float32),
-            "next": TensorDict({
-                "obs": TensorDict(next_obs, batch_size=[]),
-                "done": done,
-                "reward": torch.tensor(_marvin_binary_reward(data["reward"][row])),
-            }, batch_size=[]),
-            "_priority": torch.tensor(10.0),
-        }, batch_size=[]).unsqueeze(0))
+        replay_buffer.add(_marvin_transition(data, row))
     return size
+
+
+def _marvin_transition(data, row: int) -> TensorDict:
+    obs = {
+        "observation.state": torch.as_tensor(data["state"][row], dtype=torch.float32),
+        "observation.base_action": torch.as_tensor(data["base_action"][row], dtype=torch.float32),
+    }
+    next_obs = {
+        "observation.state": torch.as_tensor(data["next_state"][row], dtype=torch.float32),
+        "observation.base_action": torch.as_tensor(data["next_base_action"][row], dtype=torch.float32),
+    }
+    for camera in ("side_policy", "wrist_1buchong", "wrist_1", "wrist_2"):
+        obs[f"observation.images.{camera}"] = torch.as_tensor(data[f"image_{camera}"][row])
+        next_obs[f"observation.images.{camera}"] = torch.as_tensor(data[f"next_image_{camera}"][row])
+    done = torch.tensor(bool(data["terminated"][row] or data["truncated"][row]))
+    return TensorDict({
+        "obs": TensorDict(obs, batch_size=[]),
+        "action": torch.as_tensor(data["command_action"][row], dtype=torch.float32),
+        "next": TensorDict({
+            "obs": TensorDict(next_obs, batch_size=[]),
+            "done": done,
+            "reward": torch.tensor(_marvin_binary_reward(data["reward"][row])),
+        }, batch_size=[]),
+        "_priority": torch.tensor(10.0),
+    }, batch_size=[]).unsqueeze(0)
 
 # -----------------------------------------------------------------------------
 # Hugging Face buffer cache helpers (global) ---------------------------------
@@ -326,13 +344,17 @@ def main(cfg: ResidualTD3DexmgConfig):
         raise ValueError(f"Unknown base policy type: {type(base_cfg)}")
 
     # Load dataset and get normalization functions early
-    print("Loading dataset and setting up normalization...")
+    print("Loading dataset metadata and setting up normalization...")
     dataset_kwargs = {"root": cfg.offline_data.root} if cfg.offline_data.root else {}
-    dataset = LeRobotDataset(cfg.offline_data.name, **dataset_kwargs)
+    # Metadata/stats are sufficient for model construction and cache hashing.
+    # Avoid constructing LeRobotDataset (which maps every Arrow shard) until
+    # the cache-miss path actually needs to populate the replay buffer.
+    dataset_meta = LeRobotDatasetMetadata(cfg.offline_data.name, **dataset_kwargs)
+    dataset = None
 
     # Create action scaler from dataset statistics
     action_scaler = ActionScaler.from_dataset_stats(
-        action_stats=dataset.meta.stats["action"],
+        action_stats=dataset_meta.stats["action"],
         action_scale=cfg.agent.actor.action_scale,
         min_range_per_dim=cfg.offline_data.min_action_range,
         absolute_min=-1.0 if cfg.environment_backend == "marvin" else None,
@@ -342,7 +364,7 @@ def main(cfg: ResidualTD3DexmgConfig):
 
     # Create state standardizer from dataset statistics
     state_standardizer = StateStandardizer.from_dataset_stats(
-        state_stats=dataset.meta.stats["observation.state"],
+        state_stats=dataset_meta.stats["observation.state"],
         min_std=cfg.offline_data.min_state_std,
         device=device,
     )
@@ -481,6 +503,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     # ---------------------------------------------------------------------
     # Networks ------------------------------------------------------------
     # ---------------------------------------------------------------------
+    print("[Marvin startup] constructing QAgent (encoder/critic/actor)...", flush=True)
     agent = QAgent(
         obs_shape=(img_c, img_h, img_w),
         prop_shape=(lowdim_dim,),
@@ -489,6 +512,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         cfg=cfg.agent,
         residual_actor=True,  # Enable residual actor mode
     )
+    print("[Marvin startup] QAgent construction completed", flush=True)
 
     # Set up actor learning rate warmup
     actor_updates = 0
@@ -506,6 +530,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     else:
         resume_path = None
     if resume_path is not None:
+        print(f"[Marvin startup] loading learner checkpoint: {resume_path}", flush=True)
         bundle = torch.load(resume_path, map_location=device, weights_only=False)
         if bundle.get("base_policy_sha256") != marvin_replay_identity["base_policy_sha256"]:
             raise ValueError("Resume checkpoint was trained with a different ACT base policy")
@@ -524,6 +549,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         actor_updates = int(bundle.get("actor_updates", 0))
         critic_warmup_completed = bool(bundle.get("critic_warmup_completed", False))
         print(f"Resumed Marvin learner from {resume_path} at global_step={initial_global_step}")
+    else:
+        print("[Marvin startup] no learner checkpoint; starting from step 0", flush=True)
     if cfg.algo.actor_lr_warmup_steps > 0:
         print(
             f"Actor LR warmup enabled: 0.0 -> {cfg.agent.actor_lr:.2e} "
@@ -544,9 +571,13 @@ def main(cfg: ResidualTD3DexmgConfig):
     if cfg.algo.offline_fraction == 0.0:
         print("Online-only training mode: offline_fraction=0.0")
 
-    def _make_replay_buffer(max_size: int, batch_size: int) -> ReplayBuffer:
+    def _make_replay_buffer(
+        max_size: int, batch_size: int, storage=None
+    ) -> ReplayBuffer:
         common_kwargs = {
-            "storage": LazyTensorStorage(max_size=max_size, device="cpu"),
+            "storage": storage
+            if storage is not None
+            else LazyTensorStorage(max_size=max_size, device="cpu"),
             "transform": MultiStepTransform(n_steps=cfg.algo.n_step, gamma=cfg.algo.gamma),
             "pin_memory": True,
             "prefetch": cfg.algo.prefetch_batches,
@@ -607,6 +638,11 @@ def main(cfg: ResidualTD3DexmgConfig):
 
     loaded_online_from_cache = False
     known_marvin_episode_ids: set[int] = set()
+    marvin_cached_manifest_sha1: dict[int, str] = {}
+    marvin_cached_raw_transitions = 0
+    marvin_online_cache_dir = None
+    marvin_online_cache_storage = None
+    replay_root = None
     marvin_episode_count = 0
     marvin_transition_count = 0
     marvin_success_count = 0
@@ -628,14 +664,190 @@ def main(cfg: ResidualTD3DexmgConfig):
         replay_episodes, raw_replay_transitions, next_replay_episode_id = inspect_replay_directory(
             replay_root, marvin_replay_identity
         )
+        replay_fingerprint = replay_manifest_fingerprint(
+            [manifest for _path, manifest in replay_episodes]
+        )
+        marvin_online_cache_dir = ONLINE_CACHE_DIR / f"marvin_{online_cache_hash}_incremental"
+        marvin_online_cache_storage = marvin_online_cache_dir / "storage"
+        marvin_online_cache_complete = (
+            marvin_online_cache_storage / "storage_metadata.json"
+        ).is_file()
+
+        cache_metadata = {}
+        if marvin_online_cache_complete:
+            recovery = recover_pending_cache_metadata(marvin_online_cache_dir)
+            if recovery == "invalid":
+                stale_cache = marvin_online_cache_dir.with_name(
+                    f"{marvin_online_cache_dir.name}.invalid_{int(time.time())}"
+                )
+                os.replace(marvin_online_cache_dir, stale_cache)
+                print(
+                    f"[Marvin startup] quarantined interrupted online cache as {stale_cache}",
+                    flush=True,
+                )
+                marvin_online_cache_complete = False
+            elif recovery != "none":
+                print(
+                    f"[Marvin startup] recovered pending online cache commit: {recovery}",
+                    flush=True,
+                )
+
+        if marvin_online_cache_complete:
+            metadata_path = marvin_online_cache_dir / "user_metadata.json"
+            if metadata_path.is_file():
+                cache_metadata = json.loads(metadata_path.read_text())
+            validated_ids = cached_episode_ids(cache_metadata, replay_episodes)
+            if validated_ids is None:
+                stale_cache = marvin_online_cache_dir.with_name(
+                    f"{marvin_online_cache_dir.name}.invalid_{int(time.time())}"
+                )
+                os.replace(marvin_online_cache_dir, stale_cache)
+                print(
+                    "[Marvin startup] incremental cache mismatched authoritative NPZ replay; "
+                    f"quarantined as {stale_cache}",
+                    flush=True,
+                )
+                marvin_online_cache_complete = False
+
+        if marvin_online_cache_complete:
+            print(
+                f"[Marvin startup] loading incremental online replay memmap cache "
+                f"{marvin_online_cache_dir}...",
+                flush=True,
+            )
+            online_rb = _make_replay_buffer(
+                cfg.algo.buffer_size,
+                max(online_batch_size, 1),
+                storage=LazyMemmapStorage(
+                    max_size=cfg.algo.buffer_size,
+                    scratch_dir=marvin_online_cache_storage,
+                    device="cpu",
+                    existsok=True,
+                ),
+            )
+            online_rb.sampler._empty()
+            optimized_replay_buffer_loads(online_rb, marvin_online_cache_dir)
+            loaded_online_from_cache = len(online_rb) > 0
+            known_marvin_episode_ids.update(validated_ids)
+            marvin_cached_manifest_sha1.update(
+                {
+                    episode_id: manifest_sha1(manifest)
+                    for _path, manifest in replay_episodes
+                    if (episode_id := int(manifest["episode_id"])) in validated_ids
+                }
+            )
+            marvin_cached_raw_transitions = sum(
+                int(manifest["transitions"])
+                for _path, manifest in replay_episodes
+                if int(manifest["episode_id"]) in validated_ids
+            )
+            transform_name = cache_metadata.get("transform_buffer")
+            if transform_name:
+                transform_bundle = torch.load(
+                    marvin_online_cache_dir / transform_name,
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                if int(transform_bundle["buffer_size"]) != len(online_rb):
+                    raise RuntimeError("Incremental online cache transform context is stale")
+                online_rb._transform._buffer = TensorDict.from_dict(
+                    transform_bundle["buffer"],
+                    batch_size=torch.Size(transform_bundle["batch_size"]),
+                )
+                online_rb._transform._validated = True
+            elif validated_ids:
+                # Legacy caches did not persist MultiStepTransform's short
+                # look-back window. Reconstruct it from the authoritative tail
+                # so the first appended episode does not lose n_step-1 rows.
+                last_cached_id = max(validated_ids)
+                last_path = next(
+                    path
+                    for path, manifest in replay_episodes
+                    if int(manifest["episode_id"]) == last_cached_id
+                )
+                with np.load(last_path, allow_pickle=False) as data:
+                    start = max(0, len(data["reward"]) - int(cfg.algo.n_step))
+                    online_rb._transform._buffer = torch.cat(
+                        [_marvin_transition(data, row) for row in range(start, len(data["reward"]))],
+                        dim=-1,
+                    )
+                    online_rb._transform._validated = True
+            print(
+                f"[Marvin startup] loaded incremental online replay memmap cache "
+                f"(size={len(online_rb)}, cached_episodes={len(validated_ids)})",
+                flush=True,
+            )
+        else:
+            marvin_online_cache_dir.mkdir(parents=True, exist_ok=True)
+            online_rb = _make_replay_buffer(
+                cfg.algo.buffer_size,
+                max(online_batch_size, 1),
+                storage=LazyMemmapStorage(
+                    max_size=cfg.algo.buffer_size,
+                    scratch_dir=marvin_online_cache_storage,
+                    device="cpu",
+                    existsok=True,
+                ),
+            )
+
+        missing_episodes = 0
         for episode_path, _manifest in replay_episodes:
-            known_marvin_episode_ids.add(int(_manifest["episode_id"]))
+            episode_id = int(_manifest["episode_id"])
             marvin_episode_count += 1
             marvin_transition_count += int(_manifest["transitions"])
             marvin_success_count += int(bool(_manifest.get("success", False)))
-            with np.load(episode_path, allow_pickle=False) as data:
-                _add_marvin_episode(data, online_rb)
-        loaded_online_from_cache = len(online_rb) > 0
+            if episode_id not in known_marvin_episode_ids:
+                with np.load(episode_path, allow_pickle=False) as data:
+                    _add_marvin_episode(data, online_rb)
+                known_marvin_episode_ids.add(episode_id)
+                marvin_cached_manifest_sha1[episode_id] = manifest_sha1(_manifest)
+                marvin_cached_raw_transitions += int(_manifest["transitions"])
+                missing_episodes += 1
+
+        def _persist_marvin_online_cache() -> None:
+            if marvin_online_cache_dir is None:
+                return
+            transform_name = f"transform_buffer_{len(online_rb):08d}.pt"
+            transform_path = marvin_online_cache_dir / transform_name
+            transform_tmp = marvin_online_cache_dir / f".{transform_name}.tmp"
+            torch.save(
+                {
+                    "buffer_size": len(online_rb),
+                    "buffer": online_rb._transform._buffer.to_dict(),
+                    "batch_size": list(online_rb._transform._buffer.batch_size),
+                },
+                transform_tmp,
+            )
+            os.replace(transform_tmp, transform_path)
+            metadata = {
+                "schema_version": 1,
+                "replay_dir": str(replay_root),
+                "replay_manifest_fingerprint": replay_fingerprint,
+                "raw_replay_transitions": marvin_cached_raw_transitions,
+                "buffer_size": len(online_rb),
+                "transform_buffer": transform_name,
+                "episode_manifest_sha1": {
+                    str(episode_id): digest
+                    for episode_id, digest in sorted(marvin_cached_manifest_sha1.items())
+                },
+            }
+            pending_path = marvin_online_cache_dir / ".user_metadata.pending.json"
+            metadata_path = marvin_online_cache_dir / "user_metadata.json"
+            pending_path.write_text(json.dumps(metadata, indent=2) + "\n")
+            optimized_replay_buffer_dumps(online_rb, marvin_online_cache_dir)
+            os.replace(pending_path, metadata_path)
+            for stale_transform in marvin_online_cache_dir.glob("transform_buffer_*.pt"):
+                if stale_transform != transform_path:
+                    stale_transform.unlink()
+
+        if missing_episodes:
+            print(
+                f"[Marvin startup] persisting {missing_episodes} newly imported NPZ episodes "
+                "to incremental online cache...",
+                flush=True,
+            )
+            _persist_marvin_online_cache()
+        loaded_online_from_cache = True
         print(
             f"Loaded Marvin NPZ replay from {replay_root} "
             f"(raw_transitions={raw_replay_transitions}, buffer_size={len(online_rb)})"
@@ -660,14 +872,14 @@ def main(cfg: ResidualTD3DexmgConfig):
     if cfg.offline_data.num_episodes is not None:
         # Only use subset of episodes if specified
         total_frames = sum(
-            dataset.meta.episodes[ep_idx]["length"]
-            for ep_idx in range(min(cfg.offline_data.num_episodes, dataset.meta.total_episodes))
+            dataset_meta.episodes[ep_idx]["length"]
+            for ep_idx in range(min(cfg.offline_data.num_episodes, dataset_meta.total_episodes))
         )
         num_episodes = cfg.offline_data.num_episodes
     else:
         # Use entire dataset
-        total_frames = dataset.meta.total_frames
-        num_episodes = dataset.meta.total_episodes
+        total_frames = dataset_meta.total_frames
+        num_episodes = dataset_meta.total_episodes
 
     # Calculate transitions: each episode contributes (episode_length - 1) transitions
     estimated_transitions = max(0, total_frames - num_episodes)
@@ -867,6 +1079,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         offline_cache_meta["priority_beta"] = cfg.algo.priority_beta
 
     pprint.pprint(offline_cache_meta)
+    print("[Marvin startup] offline cache hash computed; checking local/HF cache...", flush=True)
 
     # Deterministically hash the metadata to create a short cache directory name
     meta_str = json.dumps(offline_cache_meta, sort_keys=True)
@@ -888,14 +1101,36 @@ def main(cfg: ResidualTD3DexmgConfig):
 
     if cfg.algo.offline_fraction > 0.0:
         # Only populate offline buffer if we're using offline data
-        if cache_dir.exists():
+        cache_storage_dir = cache_dir / "storage"
+        cache_is_complete = (cache_storage_dir / "storage_metadata.json").is_file()
+        if cache_dir.exists() and cache_is_complete:
             print(f"{cache_dir} found on disk. Attempting to load...")
+            # The cache was dumped as memmaps. Re-open those files directly on
+            # cache hits instead of loading ~tens of GB into LazyTensorStorage
+            # and copying it back out. This makes subsequent starts fast and
+            # keeps image tensors out of anonymous RAM.
+            offline_rb = _make_replay_buffer(
+                max_offline_transitions,
+                max(offline_batch_size, 1),
+                storage=LazyMemmapStorage(
+                    max_size=max_offline_transitions,
+                    scratch_dir=cache_storage_dir,
+                    device="cpu",
+                    existsok=True,
+                ),
+            )
             offline_rb.sampler._empty()
             optimized_replay_buffer_loads(offline_rb, cache_dir)
             loaded_from_cache = True
-            print(f"Loaded offline buffer from cache at {cache_dir} (size={len(offline_rb)})")
+            print(
+                f"Loaded offline buffer from memmap cache at {cache_dir} "
+                f"(size={len(offline_rb)}; no RAM copy)"
+            )
 
         if not loaded_from_cache:
+            print("[Marvin startup] offline cache miss/incomplete; loading Arrow dataset and building replay...", flush=True)
+            # Only the cache-miss path needs frame-level Arrow access.
+            dataset = LeRobotDataset(cfg.offline_data.name, **dataset_kwargs)
             added = _populate_offline_buffer(
                 dataset=dataset,
                 rb=offline_rb,
@@ -1042,6 +1277,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     print("Launching run with the following config:")
     pprint.pprint(_wandb_config)
 
+    print("[Marvin startup] entering wandb.init()...", flush=True)
     wandb.init(
         id=cfg.wandb.continue_run_id,
         resume=None if cfg.wandb.continue_run_id is None else "allow",
@@ -1053,6 +1289,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         notes=cfg.wandb.notes,
         group=cfg.wandb.group,
     )
+    print("[Marvin startup] wandb.init() completed", flush=True)
 
     # Log horizon to wandb summary
     wandb.summary["environment/horizon"] = horizon
@@ -1195,11 +1432,12 @@ def main(cfg: ResidualTD3DexmgConfig):
         os.replace(latest_tmp, checkpoint_dir / "latest.pt")
 
         keep_last = int(marvin_cfg.training_checkpoint_keep_last)
-        if keep_last <= 0:
-            raise ValueError("marvin.training_checkpoint_keep_last must be positive")
-        numbered_checkpoints = sorted(checkpoint_dir.glob("step_*.pt"))
-        for stale_checkpoint in numbered_checkpoints[:-keep_last]:
-            stale_checkpoint.unlink()
+        if keep_last < 0:
+            raise ValueError("marvin.training_checkpoint_keep_last must be non-negative")
+        if keep_last > 0:
+            numbered_checkpoints = sorted(checkpoint_dir.glob("step_*.pt"))
+            for stale_checkpoint in numbered_checkpoints[:-keep_last]:
+                stale_checkpoint.unlink()
 
         _publish_marvin_actor(step)
         print(f"Saved formal Marvin checkpoint step={step}: {step_path}")
@@ -1208,6 +1446,12 @@ def main(cfg: ResidualTD3DexmgConfig):
     # Critic warmup phase ----------------------------------------------
     # ------------------------------------------------------------------
     critic_warmup_ran = False
+    print(
+        "[Marvin startup] warmup decision: "
+        f"requested={cfg.algo.critic_warmup_steps}, "
+        f"checkpoint_completed={critic_warmup_completed}",
+        flush=True,
+    )
     if cfg.algo.critic_warmup_steps > 0 and not critic_warmup_completed:
         print(f"Critic warmup: running {cfg.algo.critic_warmup_steps} critic-only updates...")
         _run_critic_warmup(
@@ -1230,6 +1474,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         critic_warmup_ran or (initial_global_step == 0 and cfg.algo.critic_warmup_steps == 0)
     ):
         _save_marvin_state(global_step)
+    print("[Marvin startup] warmup/checkpoint stage completed", flush=True)
 
     if learner_only:
         requested_updates = int(marvin_cfg.learner_updates_per_run)
@@ -1242,9 +1487,16 @@ def main(cfg: ResidualTD3DexmgConfig):
         online_episodes_total = marvin_episode_count
         online_transitions_total = marvin_transition_count
         online_successes_total = marvin_success_count
+        print(
+            "[Marvin startup] entering learner loop: "
+            f"global_step={global_step}, online_buffer={len(online_rb)}, "
+            f"offline_buffer={len(offline_rb)}, grpc={continuous}",
+            flush=True,
+        )
 
         def _drain_grpc_transitions() -> int:
-            nonlocal online_episodes_total, online_transitions_total, online_successes_total
+            nonlocal online_episodes_total, online_transitions_total
+            nonlocal online_successes_total, marvin_cached_raw_transitions
             added = 0
             if grpc_transitions is None:
                 return added
@@ -1257,12 +1509,22 @@ def main(cfg: ResidualTD3DexmgConfig):
                 episode_id = int(episode.pop("_episode_id").item())
                 if episode_id in known_marvin_episode_ids:
                     continue
+                manifest_path = replay_root / f"episode_{episode_id:06d}.json"
+                manifest = json.loads(manifest_path.read_text())
                 episode_transitions = _add_marvin_episode(episode, online_rb)
                 added += episode_transitions
                 online_episodes_total += 1
                 online_transitions_total += episode_transitions
                 online_successes_total += int(torch.as_tensor(episode["success"]).any().item())
                 known_marvin_episode_ids.add(episode_id)
+                marvin_cached_manifest_sha1[episode_id] = manifest_sha1(manifest)
+                marvin_cached_raw_transitions += episode_transitions
+                _persist_marvin_online_cache()
+                print(
+                    f"Persisted incremental online cache through episode={episode_id} "
+                    f"(buffer_size={len(online_rb)})",
+                    flush=True,
+                )
 
         while global_step < cfg.algo.total_timesteps:
             round_updates = min(requested_updates, cfg.algo.total_timesteps - global_step)

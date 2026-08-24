@@ -14,6 +14,77 @@ COORDINATE_FRAME = "resfit_marvin_bounded_v2"
 ACTION_CONTRACT = "marvin_normalized_command_box_v1"
 
 
+def manifest_sha1(manifest: dict[str, Any]) -> str:
+    return hashlib.sha1(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+
+
+def replay_manifest_fingerprint(manifests: list[dict[str, Any]]) -> str:
+    return hashlib.sha1(json.dumps(manifests, sort_keys=True).encode()).hexdigest()[:8]
+
+
+def cached_episode_ids(
+    metadata: dict[str, Any], episodes: list[tuple[Path, dict[str, Any]]]
+) -> set[int] | None:
+    """Return the validated cached episode IDs, including legacy prefix caches."""
+    current = {
+        int(manifest["episode_id"]): manifest_sha1(manifest)
+        for _path, manifest in episodes
+    }
+    cached = metadata.get("episode_manifest_sha1")
+    if isinstance(cached, dict):
+        cached = {int(episode_id): digest for episode_id, digest in cached.items()}
+        if all(current.get(episode_id) == digest for episode_id, digest in cached.items()):
+            return set(cached)
+        return None
+
+    # Cache files created before incremental persistence contain only the
+    # fingerprint and raw size. They are reusable iff they match a prefix of
+    # the authoritative NPZ replay.
+    expected_fingerprint = metadata.get("replay_manifest_fingerprint")
+    expected_transitions = metadata.get("raw_replay_transitions")
+    if expected_fingerprint is None or expected_transitions is None:
+        return None
+    prefix: list[dict[str, Any]] = []
+    transitions = 0
+    for _path, manifest in episodes:
+        prefix.append(manifest)
+        transitions += int(manifest["transitions"])
+        if transitions == int(expected_transitions):
+            if replay_manifest_fingerprint(prefix) == expected_fingerprint:
+                return {int(item["episode_id"]) for item in prefix}
+            return None
+        if transitions > int(expected_transitions):
+            return None
+    return None
+
+
+def recover_pending_cache_metadata(cache_dir: str | Path) -> str:
+    """Finish or discard an interrupted metadata-only memmap commit."""
+    cache_dir = Path(cache_dir)
+    pending_path = cache_dir / ".user_metadata.pending.json"
+    if not pending_path.is_file():
+        return "none"
+    metadata_path = cache_dir / "user_metadata.json"
+    pending = json.loads(pending_path.read_text())
+    storage = json.loads((cache_dir / "storage" / "storage_metadata.json").read_text())
+    writer = json.loads((cache_dir / "writer" / "metadata.json").read_text())
+    actual = (int(storage["len"]), int(writer["cursor"]))
+    target = int(pending["buffer_size"])
+    transform_name = pending.get("transform_buffer")
+    transform_ready = transform_name is None or (cache_dir / transform_name).is_file()
+    if actual == (target, target):
+        if not transform_ready:
+            return "invalid"
+        os.replace(pending_path, metadata_path)
+        return "committed"
+    if metadata_path.is_file():
+        previous = json.loads(metadata_path.read_text()).get("buffer_size")
+        if previous is not None and actual == (int(previous), int(previous)):
+            pending_path.unlink()
+            return "discarded"
+    return "invalid"
+
+
 def usable_nstep_transitions(episodes: list[tuple[Path, dict[str, Any]]], n_step: int) -> int:
     if n_step <= 0:
         raise ValueError("n_step must be positive")

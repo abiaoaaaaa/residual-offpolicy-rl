@@ -10,7 +10,7 @@ num_envs: 1
 eval_num_envs: 1
 eval_num_episodes: 1
 log_freq: 100
-checkpoint_interval: 100
+checkpoint_interval: 1000
 save_video: false
 algo:
   total_timesteps: 300000
@@ -56,9 +56,9 @@ offline_data:
 marvin:
   learner_only: true
   learner_updates_per_run: 500
-  # Full checkpoints are large; keep only the two newest numbered snapshots.
-  # latest.pt and the compact deployment actor are updated atomically.
-  training_checkpoint_keep_last: 2
+  # Zero disables pruning: preserve every numbered 1,000-step checkpoint.
+  # latest.pt and the compact deployment actor are still updated atomically.
+  training_checkpoint_keep_last: 0
   async_grpc: true
   grpc_host: 127.0.0.1
   grpc_port: 50051
