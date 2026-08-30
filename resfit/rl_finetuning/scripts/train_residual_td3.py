@@ -65,12 +65,13 @@ from resfit.rl_finetuning.utils.hugging_face import (
     optimized_replay_buffer_loads,
 )
 from resfit.rl_finetuning.utils.normalization import ActionScaler, StateStandardizer
-from resfit.rl_finetuning.utils.rb_transforms import MultiStepTransform
+from resfit.rl_finetuning.utils.rb_transforms import MultiStepTransform, get_multi_step_transform
 from resfit.rl_finetuning.wrappers.residual_env_wrapper import BasePolicyVecEnvWrapper
 from resfit.rl_finetuning.marvin.env import MarvinACTBasePolicy, MarvinResidualConfig, MarvinResidualVecEnv
 from resfit.rl_finetuning.marvin.replay import (
     atomic_write_episode,
     cached_episode_ids,
+    critic_action,
     inspect_replay_directory,
     manifest_sha1,
     recover_pending_cache_metadata,
@@ -170,7 +171,7 @@ def _marvin_transition(data, row: int) -> TensorDict:
     done = torch.tensor(bool(data["terminated"][row] or data["truncated"][row]))
     return TensorDict({
         "obs": TensorDict(obs, batch_size=[]),
-        "action": torch.as_tensor(data["command_action"][row], dtype=torch.float32),
+        "action": torch.as_tensor(critic_action(data, row), dtype=torch.float32),
         "next": TensorDict({
             "obs": TensorDict(next_obs, batch_size=[]),
             "done": done,
@@ -195,9 +196,15 @@ if ONLINE_HF_REPO is not None:
 # Falls back to the current directory if unset.
 _CACHE_ROOT = Path(os.environ.get("CACHE_DIR", ".")).expanduser().resolve()
 
-# Dedicated sub-folders for the different cache types -----------------------
-OFFLINE_CACHE_DIR = _CACHE_ROOT / "offline_buffer_cache"
-ONLINE_CACHE_DIR = _CACHE_ROOT / "online_buffer_cache"
+# Dedicated sub-folders for the different cache types. Optional overrides let
+# a new online experiment reuse the large immutable offline cache without
+# sharing mutable online replay state.
+OFFLINE_CACHE_DIR = Path(
+    os.environ.get("OFFLINE_CACHE_DIR", _CACHE_ROOT / "offline_buffer_cache")
+).expanduser().resolve()
+ONLINE_CACHE_DIR = Path(
+    os.environ.get("ONLINE_CACHE_DIR", _CACHE_ROOT / "online_buffer_cache")
+).expanduser().resolve()
 
 
 # -----------------------------------------------------------------------------
@@ -321,7 +328,7 @@ def main(cfg: ResidualTD3DexmgConfig):
             raise ValueError("marvin.base_policy_checkpoint is required")
         base_policy = MarvinACTBasePolicy(marvin_cfg)
         eval_base_policy = base_policy
-    else:
+    elif cfg.environment_backend == "marvin":
         assert "base_policy" in cfg, "Base policy configuration is required"
         policy_dir, _ = download_policy_from_wandb(
             cfg.base_policy.wandb_id,
@@ -614,6 +621,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         "min_action_range": cfg.offline_data.min_action_range,
         "min_state_std": cfg.offline_data.min_state_std,
         "normalized_actions": True,
+        "critic_action_source": "applied_then_actual_then_command_v1",
         # Library versions for compatibility
         "torchrl_version": torchrl.__version__,
         "tensordict_version": tensordict.__version__,
@@ -646,6 +654,8 @@ def main(cfg: ResidualTD3DexmgConfig):
     marvin_episode_count = 0
     marvin_transition_count = 0
     marvin_success_count = 0
+    marvin_intervention_steps = 0
+    marvin_intervention_episodes = 0
     if cfg.environment_backend != "marvin" and online_cache_dir.exists():
         print(f"{online_cache_dir} found on disk. Attempting to load...")
         online_rb.sampler._empty()
@@ -743,6 +753,7 @@ def main(cfg: ResidualTD3DexmgConfig):
             )
             transform_name = cache_metadata.get("transform_buffer")
             if transform_name:
+                multi_step_transform = get_multi_step_transform(online_rb)
                 transform_bundle = torch.load(
                     marvin_online_cache_dir / transform_name,
                     map_location="cpu",
@@ -750,11 +761,11 @@ def main(cfg: ResidualTD3DexmgConfig):
                 )
                 if int(transform_bundle["buffer_size"]) != len(online_rb):
                     raise RuntimeError("Incremental online cache transform context is stale")
-                online_rb._transform._buffer = TensorDict.from_dict(
+                multi_step_transform._buffer = TensorDict.from_dict(
                     transform_bundle["buffer"],
                     batch_size=torch.Size(transform_bundle["batch_size"]),
                 )
-                online_rb._transform._validated = True
+                multi_step_transform._validated = True
             elif validated_ids:
                 # Legacy caches did not persist MultiStepTransform's short
                 # look-back window. Reconstruct it from the authoritative tail
@@ -767,11 +778,12 @@ def main(cfg: ResidualTD3DexmgConfig):
                 )
                 with np.load(last_path, allow_pickle=False) as data:
                     start = max(0, len(data["reward"]) - int(cfg.algo.n_step))
-                    online_rb._transform._buffer = torch.cat(
+                    multi_step_transform = get_multi_step_transform(online_rb)
+                    multi_step_transform._buffer = torch.cat(
                         [_marvin_transition(data, row) for row in range(start, len(data["reward"]))],
                         dim=-1,
                     )
-                    online_rb._transform._validated = True
+                    multi_step_transform._validated = True
             print(
                 f"[Marvin startup] loaded incremental online replay memmap cache "
                 f"(size={len(online_rb)}, cached_episodes={len(validated_ids)})",
@@ -796,6 +808,9 @@ def main(cfg: ResidualTD3DexmgConfig):
             marvin_episode_count += 1
             marvin_transition_count += int(_manifest["transitions"])
             marvin_success_count += int(bool(_manifest.get("success", False)))
+            intervention_steps = int(_manifest.get("intervention_steps", 0))
+            marvin_intervention_steps += intervention_steps
+            marvin_intervention_episodes += int(intervention_steps > 0)
             if episode_id not in known_marvin_episode_ids:
                 with np.load(episode_path, allow_pickle=False) as data:
                     _add_marvin_episode(data, online_rb)
@@ -807,14 +822,15 @@ def main(cfg: ResidualTD3DexmgConfig):
         def _persist_marvin_online_cache() -> None:
             if marvin_online_cache_dir is None:
                 return
+            multi_step_transform = get_multi_step_transform(online_rb)
             transform_name = f"transform_buffer_{len(online_rb):08d}.pt"
             transform_path = marvin_online_cache_dir / transform_name
             transform_tmp = marvin_online_cache_dir / f".{transform_name}.tmp"
             torch.save(
                 {
                     "buffer_size": len(online_rb),
-                    "buffer": online_rb._transform._buffer.to_dict(),
-                    "batch_size": list(online_rb._transform._buffer.batch_size),
+                    "buffer": multi_step_transform._buffer.to_dict(),
+                    "batch_size": list(multi_step_transform._buffer.batch_size),
                 },
                 transform_tmp,
             )
@@ -1474,6 +1490,17 @@ def main(cfg: ResidualTD3DexmgConfig):
         critic_warmup_ran or (initial_global_step == 0 and cfg.algo.critic_warmup_steps == 0)
     ):
         _save_marvin_state(global_step)
+    else:
+        # A resumed learner may intentionally change non-parameter actor
+        # settings such as action_scale. Publish immediately so collectors do
+        # not start from a stale deployment bundle while waiting for the next
+        # periodic publish step.
+        _publish_marvin_actor(global_step)
+        print(
+            f"Published startup Marvin actor step={global_step} "
+            f"action_scale={cfg.agent.actor.action_scale}",
+            flush=True,
+        )
     print("[Marvin startup] warmup/checkpoint stage completed", flush=True)
 
     if learner_only:
@@ -1487,6 +1514,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         online_episodes_total = marvin_episode_count
         online_transitions_total = marvin_transition_count
         online_successes_total = marvin_success_count
+        online_intervention_steps_total = marvin_intervention_steps
+        online_intervention_episodes_total = marvin_intervention_episodes
         print(
             "[Marvin startup] entering learner loop: "
             f"global_step={global_step}, online_buffer={len(online_rb)}, "
@@ -1497,6 +1526,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         def _drain_grpc_transitions() -> int:
             nonlocal online_episodes_total, online_transitions_total
             nonlocal online_successes_total, marvin_cached_raw_transitions
+            nonlocal online_intervention_steps_total, online_intervention_episodes_total
             added = 0
             if grpc_transitions is None:
                 return added
@@ -1516,6 +1546,9 @@ def main(cfg: ResidualTD3DexmgConfig):
                 online_episodes_total += 1
                 online_transitions_total += episode_transitions
                 online_successes_total += int(torch.as_tensor(episode["success"]).any().item())
+                intervention_steps = int(torch.count_nonzero(episode.get("intervened", torch.zeros(1))).item())
+                online_intervention_steps_total += intervention_steps
+                online_intervention_episodes_total += int(intervention_steps > 0)
                 known_marvin_episode_ids.add(episode_id)
                 marvin_cached_manifest_sha1[episode_id] = manifest_sha1(manifest)
                 marvin_cached_raw_transitions += episode_transitions
@@ -1566,6 +1599,13 @@ def main(cfg: ResidualTD3DexmgConfig):
                         "online/transitions_total": online_transitions_total,
                         "online/success_rate": (
                             online_successes_total / online_episodes_total
+                            if online_episodes_total
+                            else 0.0
+                        ),
+                        "online/intervention_steps_total": online_intervention_steps_total,
+                        "online/intervention_episodes_total": online_intervention_episodes_total,
+                        "online/intervention_episode_rate": (
+                            online_intervention_episodes_total / online_episodes_total
                             if online_episodes_total
                             else 0.0
                         ),
@@ -1640,7 +1680,11 @@ def main(cfg: ResidualTD3DexmgConfig):
                     "next_base_action": transition_next_obs["observation.base_action"][0].detach().cpu().numpy(),
                     "residual_action": info["residual_action"][0].detach().cpu().numpy(),
                     "command_action": info["scaled_action"][0].detach().cpu().numpy(),
+                    "applied_action": info["applied_action"][0].detach().cpu().numpy(),
+                    "requested_action": np.asarray(info["requested_action"], dtype=np.float32),
+                    "applied_command_action": np.asarray(info["applied_command_action"], dtype=np.float32),
                     "actual_action": np.asarray(info["actual_action"], dtype=np.float32),
+                    "intervened": bool(info["intervened"]),
                     "raw_reward": float(info.get("raw_reward", reward[0])),
                     "reward": float(reward[0]),
                     "success": bool(float(reward[0]) > 0.8),

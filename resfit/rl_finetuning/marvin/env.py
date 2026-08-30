@@ -214,6 +214,19 @@ class MarvinResidualVecEnv:
         raw_reward = float(transition.get("reward", 0.0))
         reward = 1.0 if raw_reward > 0.8 else 0.0
         success = bool(reward == 1.0)
+        requested_action = np.asarray(
+            transition.get("requested_action", transition.get("actual_action", command)),
+            dtype=np.float32,
+        )
+        applied_command_action = np.asarray(
+            transition.get("applied_command_action", transition.get("actual_action", requested_action)),
+            dtype=np.float32,
+        )
+        applied_action = (
+            self.action_scaler.scale(torch.from_numpy(applied_command_action).reshape(1, 5))
+            .cpu()
+            .to(torch.float32)
+        )
         if done:
             next_obs, _ = self.reset()
         else:
@@ -222,7 +235,11 @@ class MarvinResidualVecEnv:
         info = {
             "scaled_action": torch.from_numpy(combined_normalized).reshape(1, 5),
             "residual_action": torch.from_numpy(bounded).reshape(1, 5),
-            "actual_action": np.asarray(transition.get("actual_action", command), np.float32),
+            "requested_action": requested_action,
+            "applied_command_action": applied_command_action,
+            "applied_action": applied_action,
+            "actual_action": applied_command_action,
+            "intervened": bool(transition.get("intervened", False)),
             "next_base_action": self._base_action.copy(),
             "final_obs": [self._obs(final_raw, next_base_action)] if done else [None],
             "final_info": {"episode_steps": np.asarray([episode_steps]), "_episode_steps": np.asarray([0]), "succeed": success},

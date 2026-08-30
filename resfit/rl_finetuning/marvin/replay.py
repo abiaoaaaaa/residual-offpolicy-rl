@@ -14,6 +14,14 @@ COORDINATE_FRAME = "resfit_marvin_bounded_v2"
 ACTION_CONTRACT = "marvin_normalized_command_box_v1"
 
 
+def critic_action(data, row: int) -> np.ndarray:
+    """Return the best available pre-smoothing action for a replay row."""
+    key = next(
+        key for key in ("applied_action", "actual_action", "command_action") if key in data
+    )
+    return data[key][row]
+
+
 def manifest_sha1(manifest: dict[str, Any]) -> str:
     return hashlib.sha1(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
 

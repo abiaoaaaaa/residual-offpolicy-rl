@@ -10,6 +10,21 @@ from tensordict.utils import expand_right
 from torchrl.envs.transforms.transforms import Transform
 
 
+def get_multi_step_transform(replay_buffer) -> "MultiStepTransform":
+    """Return the MultiStepTransform whether TorchRL wrapped it in Compose or not."""
+    transform = replay_buffer._transform
+    if isinstance(transform, MultiStepTransform):
+        return transform
+    matches = [
+        child
+        for child in getattr(transform, "transforms", ())
+        if isinstance(child, MultiStepTransform)
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(f"Expected one MultiStepTransform, found {len(matches)}")
+    return matches[0]
+
+
 class MultiStepTransform(Transform):
     """A MultiStep transformation for ReplayBuffers.
 

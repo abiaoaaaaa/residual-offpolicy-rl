@@ -1,11 +1,14 @@
 from pathlib import Path
 
+from torchrl.data import LazyTensorStorage, TensorDictReplayBuffer
+
 from resfit.rl_finetuning.marvin.replay import (
     cached_episode_ids,
     manifest_sha1,
     recover_pending_cache_metadata,
     replay_manifest_fingerprint,
 )
+from resfit.rl_finetuning.utils.rb_transforms import MultiStepTransform, get_multi_step_transform
 
 
 def _episodes(count: int):
@@ -62,3 +65,12 @@ def test_pending_commit_requires_transform_context(tmp_path):
         '{"buffer_size": 9, "transform_buffer": "transform_buffer_00000009.pt"}'
     )
     assert recover_pending_cache_metadata(tmp_path) == "invalid"
+
+
+def test_get_multi_step_transform_unwraps_torchrl_compose():
+    expected = MultiStepTransform(n_steps=3, gamma=0.99)
+    replay_buffer = TensorDictReplayBuffer(
+        storage=LazyTensorStorage(10),
+        transform=expected,
+    )
+    assert get_multi_step_transform(replay_buffer) is replay_buffer._transform[0]

@@ -12,6 +12,7 @@ from resfit.rl_finetuning.config.rlpd import VitEncoderConfig
 from resfit.rl_finetuning.off_policy.networks.encoder import VitEncoder
 from resfit.rl_finetuning.utils.normalization import ActionScaler
 from lerobot.scripts.rl.learner_service import LearnerService
+from resfit.rl_finetuning.marvin.replay import critic_action
 
 
 def test_marvin_scaler_never_expands_past_physical_box():
@@ -84,3 +85,16 @@ def test_empty_parameter_stream_waits_instead_of_busy_spinning():
 
     assert list(service.StreamParameters(None, None)) == []
     assert shutdown.waits == [1.0]
+
+
+def test_critic_action_prefers_applied_pre_smoothing_action():
+    data = {
+        "command_action": np.full((1, 5), 0.2, dtype=np.float32),
+        "actual_action": np.full((1, 5), 0.9, dtype=np.float32),
+        "applied_action": np.full((1, 5), 0.8, dtype=np.float32),
+    }
+    np.testing.assert_allclose(critic_action(data, 0), np.full(5, 0.8))
+    data.pop("applied_action")
+    np.testing.assert_allclose(critic_action(data, 0), np.full(5, 0.9))
+    data.pop("actual_action")
+    np.testing.assert_allclose(critic_action(data, 0), np.full(5, 0.2))

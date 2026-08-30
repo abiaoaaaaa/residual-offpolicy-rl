@@ -254,8 +254,12 @@ def main() -> None:
                     "base_action": obs["observation.base_action"].numpy()[0],
                     "residual_action": info["residual_action"].numpy()[0],
                     "command_action": info["scaled_action"].numpy()[0],
+                    "applied_action": info["applied_action"].numpy()[0],
                     "next_base_action": transition_next_obs["observation.base_action"].numpy()[0],
+                    "requested_action": np.asarray(info["requested_action"], dtype=np.float32),
+                    "applied_command_action": np.asarray(info["applied_command_action"], dtype=np.float32),
                     "actual_action": np.asarray(info["actual_action"], dtype=np.float32),
+                    "intervened": bool(info["intervened"]),
                     "raw_reward": float(info.get("raw_reward", reward[0])),
                     "reward": float(reward[0]), "success": bool(float(reward[0]) > 0.8),
                     "terminated": bool(terminated[0]), "truncated": bool(truncated[0]),
@@ -278,6 +282,8 @@ def main() -> None:
                 "residual_checkpoint": str(Path(args.residual_checkpoint).resolve()) if args.residual_checkpoint else "zero_residual",
                 "residual_scale": args.residual_scale,
                 "success": episode_success,
+                "intervention_steps": int(np.count_nonzero(arrays["intervened"])),
+                "intervened": bool(np.any(arrays["intervened"])),
             }
             atomic_write_episode(output, episode, arrays, manifest)
             if args.async_grpc:
@@ -292,6 +298,7 @@ def main() -> None:
             usable_transitions += max(0, len(rows) - args.n_step + 1)
             print(
                 f"Saved replay episode={episode} transitions={len(rows)}; "
+                f"intervention_steps={manifest['intervention_steps']}; "
                 f"directory_total={total_transitions}, usable_nstep_total="
                 f"{usable_transitions}/{args.min_transitions or usable_transitions}"
             )
