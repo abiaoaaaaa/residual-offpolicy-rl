@@ -13,7 +13,7 @@ from torch import nn
 from resfit.rl_finetuning.config.rlpd import QAgentConfig
 from resfit.rl_finetuning.off_policy import common_utils
 from resfit.rl_finetuning.off_policy.common_utils import utils
-from resfit.rl_finetuning.off_policy.networks.encoder import VitEncoder
+from resfit.rl_finetuning.off_policy.networks.encoder import ResNetEncoder, VitEncoder
 from resfit.rl_finetuning.off_policy.rl.actor import Actor
 from resfit.rl_finetuning.off_policy.rl.critic import Critic
 
@@ -163,6 +163,8 @@ class QAgent(nn.Module):
         for _ in self.rl_cameras:
             if self.cfg.enc_type == "vit":
                 enc = VitEncoder(obs_shape, self.cfg.vit).to(self.cfg.device)
+            elif self.cfg.enc_type == "resnet":
+                enc = ResNetEncoder(obs_shape, self.cfg.vit).to(self.cfg.device)
             else:
                 raise AssertionError(f"Unknown encoder type {self.cfg.enc_type}.")
 
@@ -179,7 +181,9 @@ class QAgent(nn.Module):
 
     def train(self, training=True):
         self.training = training
-        self.encoders.train(training)
+        # A frozen pretrained encoder must also keep BatchNorm statistics
+        # fixed; requires_grad=False alone would still mutate running stats.
+        self.encoders.train(training and not self.cfg.freeze_encoder)
         self.actor.train(training)
         self.critic.train(training)
 
@@ -218,21 +222,22 @@ class QAgent(nn.Module):
         normalised.
         """
         feats = []
-        for cam_idx, cam_name in enumerate(self.rl_cameras):
-            data = obs[cam_name]
+        with torch.set_grad_enabled(torch.is_grad_enabled() and not self.cfg.freeze_encoder):
+            for cam_idx, cam_name in enumerate(self.rl_cameras):
+                data = obs[cam_name]
 
-            if data.dtype == torch.uint8:
-                # uint8 → float32 in [0,1]
-                data = data.float().div_(255.0)
-            else:
-                data = data.float()
+                if data.dtype == torch.uint8:
+                    # uint8 → float32 in [0,1]
+                    data = data.float().div_(255.0)
+                else:
+                    data = data.float()
 
-            if augment:
-                data = self.aug(data)
+                if augment:
+                    data = self.aug(data)
 
-            # Forward pass through the *corresponding* encoder
-            feat_cam = self.encoders[cam_idx].forward(data, flatten=False)
-            feats.append(feat_cam)
+                # Forward pass through the *corresponding* encoder
+                feat_cam = self.encoders[cam_idx].forward(data, flatten=False)
+                feats.append(feat_cam)
 
         # Concatenate along the *patch* dimension (dim=1)
         feat_all = torch.cat(feats, dim=1)

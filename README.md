@@ -1,5 +1,9 @@
 # ResFiT
 
+## Pi0.5 residual RL 快速入口
+
+新对话或新 AI 先阅读 [AI_CONTEXT.md](./AI_CONTEXT.md)，其中包含当前 OpenPI residual RL 的动作语义、目录、双 buffer、键盘、VLAHost、训练命令和真机调试顺序。实现细节见 [pi05 residual pipeline](./resfit/pi05_residual/PIPELINE.md)。
+
 This repository contains the official release of code for paper "Residual Off-Policy RL for Finetuning Behavior Cloning Policies".
 
 Website: https://residual-offpolicy-rl.github.io/

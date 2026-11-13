@@ -91,6 +91,7 @@ class ActorConfig:
     num_layers: int = 2
     # Layer normalization control
     use_layer_norm: bool = True
+    residual_action_mask: tuple[float, ...] | None = None
 
 
 @dataclass

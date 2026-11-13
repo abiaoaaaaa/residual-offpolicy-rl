@@ -9,6 +9,35 @@ from resfit.rl_finetuning.config.rlpd import VitEncoderConfig
 from resfit.rl_finetuning.off_policy.networks.min_vit import MinVit
 
 
+class ResNetEncoder(nn.Module):
+    """Small spatial ResNet encoder for the three-camera residual actor."""
+
+    def __init__(self, obs_shape: tuple[int, int, int], cfg: VitEncoderConfig):
+        super().__init__()
+        try:
+            from torchvision.models import ResNet18_Weights, resnet18
+        except ImportError as exc:
+            raise ImportError("enc_type='resnet' requires torchvision") from exc
+        net = resnet18(weights=ResNet18_Weights.DEFAULT)
+        net.fc = nn.Identity()
+        self.backbone = nn.Sequential(*list(net.children())[:-2])
+        self.patch_repr_dim = 512
+        self.register_buffer(
+            "image_mean", torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            "image_std", torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
+        )
+        h, w = obs_shape[-2:]
+        self.repr_dim = self.patch_repr_dim * max(1, (h + 31) // 32) * max(1, (w + 31) // 32)
+
+    def forward(self, obs, flatten=True):
+        feats = self.backbone((obs - self.image_mean) / self.image_std)
+        feats = feats.flatten(2)
+        feats = feats.transpose(1, 2)
+        return feats.flatten(1) if flatten else feats
+
+
 class VitEncoder(nn.Module):
     def __init__(self, obs_shape: tuple[int, int, int], cfg: VitEncoderConfig):
         super().__init__()

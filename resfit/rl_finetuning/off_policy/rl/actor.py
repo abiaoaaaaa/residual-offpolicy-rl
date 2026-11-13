@@ -169,7 +169,15 @@ class Actor(nn.Module):
 
         # Scale the mean by action_scale
         # NOTE: std is already in environment action space (more interpretable)
-        scaled_mu = mu * self.cfg.action_scale
+        action_scale = torch.as_tensor(
+            self.cfg.action_scale, device=mu.device, dtype=mu.dtype
+        )
+        scaled_mu = mu * action_scale
+        mask = getattr(self.cfg, "residual_action_mask", None)
+        if self.residual_actor and mask is not None:
+            scaled_mu = scaled_mu * torch.as_tensor(
+                mask, device=scaled_mu.device, dtype=scaled_mu.dtype
+            )
 
         # Create distribution with scaled mean but environment-scale std
         action_dist = utils.TruncatedNormal(scaled_mu, std)
